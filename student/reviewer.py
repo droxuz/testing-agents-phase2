@@ -19,7 +19,7 @@ import re
 from jinja2 import StrictUndefined, Template
 from minisweagent.exceptions import FormatError
 
-VOTES = 2
+VOTES = 1       # after the blind oracle (oracle.py) one review is enough
 MAX_REVIEWED_PER_FILE = 8
 VERDICT = re.compile(r"\b(test\w*)\s*[:=-]\s*\**\s*(KEEP|DROP)\b", re.I)
 

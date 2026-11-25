@@ -171,3 +171,55 @@ def spec_view(workspace: Path, unit: Unit) -> str:
                 for m in methods:
                     describe(m, "    ")
     return "\n".join(out)
+
+
+def _identifiers(tree: ast.AST) -> set[str]:
+    names = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            names.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            names.add(n.attr)
+    return {n for n in names if len(n) > 2 and not n.startswith("_")}
+
+
+def existing_tests(workspace: Path, test_sources: list[str], max_lines: int = 90) -> str:
+    """The project's own tests (tests/, they all pass) that use the same API as test_sources.
+
+    They pass on the current code, so they show real behaviour wherever they check it: a new test
+    that contradicts them is wrong. (The bugs are in places these tests do not check.)
+    """
+    root = Path(workspace) / "tests"
+    wanted = set()
+    for source in test_sources:
+        try:
+            wanted |= _identifiers(ast.parse(source))
+        except SyntaxError:
+            pass
+    wanted -= {"assert", "len", "list", "dict", "set", "tuple", "int", "str", "range", "self", "pytest",
+               "raises", "assertEqual", "assertTrue", "assertFalse", "assertIn", "assertNotIn", "assertRaises",
+               "True", "False", "None", "value", "key", "keys", "values", "items", "test"}
+    if not wanted or not root.is_dir():
+        return ""
+    scored = []
+    for path in sorted(root.rglob("test*.py")):
+        text = path.read_text(errors="replace")
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+                hits = _identifiers(node) & wanted
+                if hits:
+                    weight = sum(3 if h[:1].isupper() else 1 for h in hits)
+                    source = ast.get_source_segment(text, node) or ""
+                    scored.append((-weight, len(source), f"# {path.relative_to(root.parent)}\n{source}"))
+    picked, used = [], 0
+    for _, _, source in sorted(scored):
+        n = source.count("\n") + 1
+        if used + n > max_lines:
+            continue
+        picked.append(source)
+        used += n
+    return "\n\n".join(picked)

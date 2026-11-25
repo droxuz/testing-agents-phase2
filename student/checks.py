@@ -50,6 +50,83 @@ def rejection_reason(path: Path) -> str:
     return ""
 
 
+TOP_LEVEL = re.compile(r"^(?:def |async def |class |@)", re.M)
+
+
+def drop_unparsable_tests(path: Path) -> int:
+    """Remove top-level functions or classes with a syntax error, keeping the rest of the file.
+
+    One bad line (e.g. a positional argument after a keyword) would otherwise lose every test in it.
+    Returns how many blocks were removed, or -1 if the imports at the top do not parse either.
+    """
+    text = path.read_text()
+    try:
+        ast.parse(text)
+        return 0
+    except SyntaxError:
+        pass
+    starts = [m.start() for m in TOP_LEVEL.finditer(text)]
+    if not starts:
+        return -1
+    header, blocks = text[:starts[0]], [text[a:b] for a, b in zip(starts, starts[1:] + [len(text)])]
+    # a decorator line belongs to the block that follows it
+    merged = []
+    for block in blocks:
+        if merged and not re.search(r"^(?:def |async def |class )", merged[-1], re.M):
+            merged[-1] += block
+        else:
+            merged.append(block)
+    try:
+        ast.parse(header)
+    except SyntaxError:
+        return -1
+    good = []
+    for block in merged:
+        try:
+            ast.parse(header + block)
+            good.append(block)
+        except SyntaxError:
+            pass
+    try:
+        ast.parse(header + "".join(good))
+    except SyntaxError:
+        return -1
+    path.write_text(header + "".join(good))
+    return len(merged) - len(good)
+
+
+class _ChainFixer(ast.NodeTransformer):
+    """`x in s is True` means `x in s and s is True` in Python, so it is always False.
+
+    The writer means `(x in s) is True`; rewrite it to `x in s` (or `not (x in s)` for `is False`).
+    """
+
+    def __init__(self):
+        self.fixed = 0
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        last, value = node.ops[-1], node.comparators[-1]
+        if (len(node.ops) >= 2 and isinstance(last, (ast.Is, ast.IsNot))
+                and isinstance(value, ast.Constant) and isinstance(value.value, bool)):
+            inner = ast.Compare(left=node.left, ops=node.ops[:-1], comparators=node.comparators[:-1])
+            self.fixed += 1
+            if value.value == isinstance(last, ast.Is):
+                return ast.copy_location(inner, node)
+            return ast.copy_location(ast.UnaryOp(op=ast.Not(), operand=inner), node)
+        return node
+
+
+def fix_chained_comparisons(path: Path) -> int:
+    """Rewrite `a OP b is True/False` (always False in Python) to what the writer meant."""
+    tree = ast.parse(path.read_text())
+    fixer = _ChainFixer()
+    tree = fixer.visit(tree)
+    if fixer.fixed:
+        path.write_text(ast.unparse(ast.fix_missing_locations(tree)) + "\n")
+    return fixer.fixed
+
+
 def add_missing_imports(path: Path) -> list[str]:
     """Add imports for well-known modules the file uses but never imports. Returns what was added."""
     text = path.read_text()
@@ -67,11 +144,12 @@ def add_missing_imports(path: Path) -> list[str]:
     return missing
 
 
-def run_tests(workspace: Path, target: str, timeout: int = 110) -> dict[str, str]:
+def run_tests(workspace: Path, target: str, timeout: int = 110, lines: dict | None = None) -> dict[str, str]:
     """Run pytest on target; return {"Class::test" or "test": outcome}.
 
     Outcome is "passed", "skipped", "assertion: <message>" (failed on an assert or a pytest.raises
     that did not raise), or "error: <message>". {"<timeout>": ...} if the whole run timed out.
+    If lines is given, it gets {key: line number in target where the test failed}.
     """
     with tempfile.TemporaryDirectory() as tmp:
         report = Path(tmp) / "report.xml"
@@ -94,6 +172,10 @@ def run_tests(workspace: Path, target: str, timeout: int = 110) -> dict[str, str
             outcome = "error: " + (error.get("message") or "error")[:200]
         elif failure is not None:
             message = (failure.get("message") or "").strip()
+            where = re.findall(r"^(\S*?)([^/\s]+\.py):(\d+): ", failure.text or "", re.M)
+            where = [int(n) for _, base, n in where if base == Path(target).name]
+            if lines is not None and where:
+                lines[key] = where[-1]
             kind = "assertion: " if message.startswith(ASSERTION_PREFIXES) else "error: "
             outcome = kind + message[:300]
         elif skipped is not None:

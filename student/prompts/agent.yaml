@@ -24,6 +24,15 @@ unit_template: |
   {{docs}}
   ```
 
+  ## Already found for this unit
+
+  These tests were written earlier and already report a problem. Do not test the same behaviour
+  again; look for different bugs.
+
+  ```python
+  {{already}}
+  ```
+
   ## Your task
 
   Write `{{test_file}}`: 8 to 15 small pytest test functions. Focus on {{focus}}.
@@ -35,7 +44,13 @@ unit_template: |
   - Only use names and parameters that appear in the code above. Test through the public API:
     import public names (not starting with `_`) from `{{package}}` or `{{module}}`.
   - Tests must be deterministic: no randomness, no real sleeping, no clocks. Where the code accepts a
-    timer or similar function, pass your own fake one.
+    timer or similar function, pass your own fake one whose value you set explicitly between steps
+    (for example `now = [0]`, `timer=lambda: now[0]`, then `now[0] = 5`); never one that changes
+    each time it is called, because how often the code calls it is not documented.
+  - For eviction order, read items explicitly before the insert that evicts, so it is clear which
+    one was used least or most recently. Do not assume inserting or updating an item counts as a use.
+  - Write `assert x in s` or `assert x not in s`, never `assert x in s is True` (in Python that
+    means `x in s and s is True`, which is always False).
   - Do not import os, sys, inspect, pathlib, io or subprocess, and do not call open, eval or exec.
 
   Everything you need is above: do not read any files. Reply with ONE bash command that writes the
@@ -69,7 +84,9 @@ review_template: |
   test depends on a detail the documentation does not state, for example: the iteration or display
   order of items (unless the docs say how they are ordered), how many times a callback, timer or
   key function is called, the exact type or internal structure of a returned object, `repr` or
-  error message text, or which item is chosen when several are equally valid.
+  error message text, which item is chosen when several are equally valid, whether an item is
+  still valid at the exact instant it expires (unless the docs say "before" or "at"), or whether
+  inserting or updating an item counts as "using" it for an eviction policy (unless the docs say so).
 
   ## Documentation
 
@@ -83,6 +100,16 @@ review_template: |
   {{spec}}
   ```
 
+  ## The project's own tests
+
+  These tests come with the project and all PASS on the current code, so they show how the code
+  really behaves wherever they check it (the bugs are in places they do not check). If a failing
+  test expects something that these tests contradict, the failing test is wrong: DROP it.
+
+  ```python
+  {{existing}}
+  ```
+
   ## Failing tests
 
   {{tests}}
@@ -94,3 +121,54 @@ review_template: |
   with ONE bash command that prints one line per test ({{names}}), like this:
 
   printf 'test_name_one: KEEP\ntest_name_two: DROP\n'
+
+oracle_system_template: |
+  You predict what Python code does, using only the documentation of the library it calls. You have
+  a bash tool. Answer with exactly one bash command: a heredoc with your answer lines.
+
+oracle_template: |
+  # Project: {{project}}
+
+  {{summary}}
+
+  Below are short snippets that use `{{unit}}` (module `{{module}}`). For each one, work out from
+  the documentation what `result` is at the end (or whether the last block raises). The library
+  may contain small bugs, so do not guess what a buggy implementation might do: say what the
+  documentation and the project's own tests say it should be.
+
+  ## Documentation
+
+  ```rst
+  {{docs}}
+  ```
+
+  ## Signatures and docstrings
+
+  ```python
+  {{spec}}
+  ```
+
+  ## The project's own tests
+
+  These come with the project and pass, so they show the real behaviour wherever they check it.
+
+  ```python
+  {{existing}}
+  ```
+
+  ## Snippets
+
+  {{snippets}}
+
+  ## How to answer
+
+  For each snippet, trace it line by line and write down the state after each statement (for a
+  container: its full contents and order; for a cache: which items it holds and which one would be
+  evicted next). Then reply with ONE bash command that prints one line per snippet ({{names}}),
+  each a Python literal (or RAISES / NO where asked), like this:
+
+  cat <<'EOF'
+  snippet_1: [1, 2, 3]
+  snippet_2: 'b'
+  snippet_3: True
+  EOF

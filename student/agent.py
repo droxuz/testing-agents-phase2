@@ -16,14 +16,17 @@ So the agent works like this, for each unit of code and in several rounds with d
 3. Triage (Python, checks.py): add missing imports, run the file twice, and remove tests that
    crash with an error, change outcome between runs, or pass. Only tests that fail on an assertion
    remain: each one claims to have found a bug.
-4. Review (model, reviewer.py): independent reviewers who see the docs and signatures but not the
-   function bodies decide for each claim whether the code or the test is wrong. Only unanimous
-   KEEP verdicts stay.
+4. Blind oracle (model, oracle.py): each failing test is cut off before its failing assert, and
+   model calls that see only the docs, signatures and the project's own tests predict the value.
+   A claim is kept only if ORACLE_VOTES independent predictions all agree with the test.
+   (An earlier version then asked a KEEP/DROP reviewer, reviewer.py; on run oracle-r1 the reviewer
+   dropped 39 real claims for 3 false alarms it caught, so it is off by default: TA_REVIEW=1.)
 
 Every model call goes through `model`, the harness's budgeted model.
 """
 
 import json
+import os
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -35,9 +38,10 @@ import yaml
 from jinja2 import StrictUndefined, Template
 from minisweagent.exceptions import FormatError, LimitsExceeded
 
-from checks import (add_missing_imports, private_name_tests, rejection_reason, remove_tests, run_tests,
+from checks import (add_missing_imports, drop_unparsable_tests, fix_chained_comparisons, private_name_tests, rejection_reason, remove_tests, run_tests,
                     test_sources, uncollectable_files)
-from planner import doc_snippets, plan, spec_view
+from planner import doc_snippets, existing_tests, plan, spec_view
+from oracle import predict
 from reviewer import review
 
 MAX_QUERIES_PER_UNIT = 3      # model calls allowed to get the file written
@@ -45,7 +49,11 @@ MIN_TOKENS_FOR_UNIT = 15_000  # do not start a unit (write + review) with less b
 MAX_ROUNDS = 6
 TEST_HEADROOM = 20            # stop a little before the evaluator's test limit
 WORKERS = 4                   # units worked on at the same time (model calls are slow)
-MAX_KEPT_PER_UNIT = 2         # bug-claiming tests kept per unit over all rounds (about 1 bug per 200 lines)
+MAX_KEPT_PER_UNIT = 3         # bug-claiming tests kept per unit over all rounds
+# Which claim filters run. The defaults are our final agent; the environment variables exist only so the
+# ablation runs for the report can switch a technique off (docker run -e TA_ORACLE_VOTES=0 ...).
+ORACLE_VOTES = int(os.environ.get("TA_ORACLE_VOTES", "2"))   # blind predictions that must all agree
+USE_REVIEW = os.environ.get("TA_REVIEW", "0") == "1"         # the KEEP/DROP reviewer (reviewer.py)
 MAX_ERRORS = 6                # stop the project after this many failed units in a row
 FOCUSES = [
     "the documented behaviour: what the docstrings and docs above promise, and any `>>>` examples in them",
@@ -82,12 +90,15 @@ def triage(workspace: Path, test_file: Path, rel: str, package: str) -> tuple[di
     """Remove tests that error, are flaky, pass or use private names.
 
     Returns (info, {key: failure} of the tests left, which all fail on an assertion)."""
+    salvaged = drop_unparsable_tests(test_file)
     reason = rejection_reason(test_file)
     if reason:
         test_file.unlink()
         return {"dropped_file": reason}, {}
-    info = {"added_imports": add_missing_imports(test_file)}
-    first = run_tests(workspace, rel)
+    info = {"added_imports": add_missing_imports(test_file), "unparsable_removed": salvaged,
+            "chains_fixed": fix_chained_comparisons(test_file)}
+    lines = {}
+    first = run_tests(workspace, rel, lines=lines)
     if not first or any(k.startswith("<") for k in first):
         test_file.unlink()
         return info | {"dropped_file": next(iter(first.values()), "no tests collected")}, {}
@@ -100,6 +111,7 @@ def triage(workspace: Path, test_file: Path, rel: str, package: str) -> tuple[di
     info["private"] = len(private)
     failing = {k: v for k, v in first.items()
                if v.startswith("assertion") and second.get(k) == v and k not in private}
+    info["fail_lines"] = {k: lines[k] for k in failing if k in lines}
     return info, failing
 
 
@@ -153,6 +165,7 @@ def solve(task, model, env) -> None:
     log = {"project": task.project, "units": len(units), "steps": []}
     state = {"tests": 0, "stop": False, "errors": 0}
     kept_per_unit = {u.slug: 0 for u in units}
+    kept_sources = {u.slug: [] for u in units}   # tests already kept, shown to later rounds of that unit
     lock = threading.Lock()
 
     def do_unit(round_no: int, i: int, unit) -> None:
@@ -170,17 +183,39 @@ def solve(task, model, env) -> None:
         base = dict(project=task.project, package=task.package, summary=task.summary, unit=unit.name,
                     module=unit.module, file=unit.file, first_line=unit.first_line, last_line=unit.last_line,
                     source=unit.source, docs=docs[unit.slug], spec=specs[unit.slug])
+        with lock:
+            already = "\n\n".join(kept_sources[unit.slug]) or "(none yet)"
         entry = {"round": round_no, "unit": unit.name, "file": rel}
         trajectory = {}
         try:
-            trajectory["write"] = write_unit(counter, env, prompts, base | {"focus": focus, "test_file": rel}, path)
+            trajectory["write"] = write_unit(counter, env, prompts, base | {"focus": focus, "test_file": rel,
+                                                                       "already": already}, path)
             if path.exists():
                 info, failing = triage(workspace, path, rel, task.package)
                 entry |= info
                 entry["claims"] = sorted(failing)
                 kept = set()
                 if failing:
-                    kept, trajectory["review"] = review(counter, prompts, base, failing, test_sources(path))
+                    sources = test_sources(path)
+                    evidence = existing_tests(workspace, [sources[k] for k in failing if k in sources])
+                    context = base | {"existing": evidence or "(no existing tests use the same names)"}
+                    fail_lines = entry.pop("fail_lines")
+                    agreed, unasked, trajectory["oracle"] = set(failing), set(), []
+                    for _ in range(ORACLE_VOTES):     # independent blind predictions; all must agree
+                        asked = {k: v for k, v in failing.items() if k in agreed}
+                        if not asked:
+                            break
+                        agreed, still_unasked, oracle_log = predict(counter, prompts, context,
+                                                                    path.read_text(), asked, fail_lines)
+                        unasked |= still_unasked
+                        trajectory["oracle"].append(oracle_log)
+                    entry["oracle_agreed"], entry["oracle_unasked"] = sorted(agreed), sorted(unasked)
+                    if USE_REVIEW:            # claims the oracle could not ask about go to the reviewer too
+                        survivors = {k: v for k, v in failing.items() if k in agreed | unasked}
+                        if survivors:
+                            kept, trajectory["review"] = review(counter, prompts, context, survivors, sources)
+                    else:
+                        kept = agreed
                 with lock:             # reserve this unit's remaining share
                     room = max(0, MAX_KEPT_PER_UNIT - kept_per_unit[unit.slug])
                     kept = set(sorted(kept)[:room])
@@ -188,6 +223,10 @@ def solve(task, model, env) -> None:
                 if path.exists():
                     entry["kept"] = keep_only(workspace, path, rel, kept)
                     entry["kept_tests"] = sorted(kept)
+                    if entry["kept"]:
+                        sources = test_sources(path)
+                        with lock:
+                            kept_sources[unit.slug] += [sources[k] for k in sorted(kept) if k in sources]
             else:
                 entry["dropped_file"] = "never written"
         except Exception as error:     # budget used up, or a bad response from the API
