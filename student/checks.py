@@ -127,6 +127,78 @@ def fix_chained_comparisons(path: Path) -> int:
     return fixer.fixed
 
 
+def _package_names(workspace: Path, package: str) -> dict[str, dict[str, set[str]]]:
+    """{module: {"defined": top-level names it defines or imports}} for every module of the package."""
+    names = {}
+    for file in sorted((Path(workspace) / package).rglob("*.py")):
+        module = ".".join(file.relative_to(workspace).with_suffix("").parts)
+        module = module[: -len(".__init__")] if module.endswith(".__init__") else module
+        try:
+            tree = ast.parse(file.read_text())
+        except SyntaxError:
+            continue
+        defined = set()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                defined |= {t.id for t in targets if isinstance(t, ast.Name)}
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                defined |= {(a.asname or a.name).split(".")[0] for a in node.names}
+        names[module] = defined
+    for module in list(names):                                            # `from pkg import sub` works too
+        parent = module.rsplit(".", 1)[0]
+        if parent in names and parent != module:
+            names[parent].add(module.rsplit(".", 1)[-1])
+    return names
+
+
+def fix_imports(workspace: Path, path: Path, package: str) -> list[str]:
+    """Move `from pkg.a import X` to the one module of the package that defines X, if a does not,
+    and drop X from the import if no module defines it.
+
+    One import of a name from the wrong module stops the whole file from loading (every test in it
+    is lost), and the model often guesses the module wrong. Returns the names that were moved.
+    """
+    text = path.read_text()
+    tree = ast.parse(text)
+    modules = _package_names(workspace, package)
+    lines = text.splitlines(keepends=True)
+    moved, edits = [], []
+    for node in tree.body:
+        if not (isinstance(node, ast.ImportFrom) and node.level == 0
+                and (node.module or "").split(".")[0] == package and node.module in modules):
+            continue
+        keep, move, gone = [], [], []
+        for alias in node.names:
+            if alias.name == "*" or alias.name in modules[node.module]:
+                keep.append(alias)
+                continue
+            homes = [m for m, defined in modules.items() if alias.name in defined and m != node.module]
+            if len(homes) == 1:
+                move.append((homes[0], alias))
+            elif not homes:
+                gone.append(alias.name)    # defined nowhere: only the tests that use it should fail
+            else:
+                keep.append(alias)
+        if not move and not gone:
+            continue
+
+        def clause(aliases):
+            return ", ".join(a.name + (f" as {a.asname}" if a.asname else "") for a in aliases)
+
+        new = [f"from {node.module} import {clause(keep)}\n"] if keep else []
+        new += [f"from {home} import {clause([a])}\n" for home, a in move]
+        edits.append((node.lineno - 1, node.end_lineno, "".join(new)))
+        moved += [a.name for _, a in move] + [f"{name} (removed)" for name in gone]
+    for start, end, new in sorted(edits, reverse=True):
+        lines[start:end] = [new]
+    if edits:
+        path.write_text("".join(lines))
+    return moved
+
+
 def add_missing_imports(path: Path) -> list[str]:
     """Add imports for well-known modules the file uses but never imports. Returns what was added."""
     text = path.read_text()

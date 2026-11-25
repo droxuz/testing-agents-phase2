@@ -12,7 +12,7 @@ unit_template: |
 
   ## Unit: {{unit}}
 
-  Module `{{module}}`, file `{{file}}`, lines {{first_line}}-{{last_line}}.
+  Module `{{module}}`, file `{{file}}`, lines {{first_line}}-{{last_line}}. Shown: {{view}}.
 
   ```python
   {{source}}
@@ -23,6 +23,13 @@ unit_template: |
   ```rst
   {{docs}}
   ```
+
+  ## Test design hints (computed from the code)
+
+  {{hints}}
+
+  Bugs hide in the cases above that ordinary tests skip, so cover them: at least half of your
+  tests should use one of these boundary values or input classes.
 
   ## Already found for this unit
 
@@ -39,7 +46,8 @@ unit_template: |
 
   - The code above may be buggy. Decide each expected value from the documentation, the docstrings,
     the names, and your own reasoning about what the code promises, never from what the code does.
-    Work small examples out by hand.
+    Work small examples out by hand. If the code seems to disagree with the documentation, that is
+    probably a bug: assert the documented value (a test that asserts the buggy value is useless).
   - Each test checks one thing with a plain `assert` against an exact expected value.
   - Only use names and parameters that appear in the code above. Test through the public API:
     import public names (not starting with `_`) from `{{package}}` or `{{module}}`.

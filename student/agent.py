@@ -9,10 +9,13 @@ What we learned from the starter agent and from our first versions (runs units-r
   with every bug in place, but it can still be a false alarm if it encodes a bug's behaviour.
 
 So the agent works like this, for each unit of code and in several rounds with different focuses:
-1. Plan (Python, planner.py): split the package into units of at most ~220 source lines and find
-   the documentation paragraphs about each unit.
-2. Write (model): one short conversation that is shown the unit's code and docs and writes one
-   test file in a single command.
+1. Plan (Python, planner.py, hints.py): split the package into units of at most ~220 source lines,
+   find the documentation paragraphs about each unit, and compute test design hints from the code:
+   boundary values from its constants and defaults, and input classes from its branches and
+   parameters (boundary value analysis and equivalence partitioning).
+2. Write (model): one short conversation that is shown the unit's code (odd rounds, white-box) or
+   only its signatures and docstrings (even rounds, black-box: the writer cannot copy a bug it
+   cannot see), the docs and the hints, and writes one test file in a single command.
 3. Triage (Python, checks.py): add missing imports, run the file twice, and remove tests that
    crash with an error, change outcome between runs, or pass. Only tests that fail on an assertion
    remain: each one claims to have found a bug.
@@ -38,8 +41,9 @@ import yaml
 from jinja2 import StrictUndefined, Template
 from minisweagent.exceptions import FormatError, LimitsExceeded
 
-from checks import (add_missing_imports, drop_unparsable_tests, fix_chained_comparisons, private_name_tests, rejection_reason, remove_tests, run_tests,
+from checks import (add_missing_imports, drop_unparsable_tests, fix_chained_comparisons, fix_imports, private_name_tests, rejection_reason, remove_tests, run_tests,
                     test_sources, uncollectable_files)
+from hints import hints
 from planner import doc_snippets, existing_tests, plan, spec_view
 from oracle import predict
 from reviewer import review
@@ -96,6 +100,7 @@ def triage(workspace: Path, test_file: Path, rel: str, package: str) -> tuple[di
         test_file.unlink()
         return {"dropped_file": reason}, {}
     info = {"added_imports": add_missing_imports(test_file), "unparsable_removed": salvaged,
+            "imports_moved": fix_imports(workspace, test_file, package),
             "chains_fixed": fix_chained_comparisons(test_file)}
     lines = {}
     first = run_tests(workspace, rel, lines=lines)
@@ -162,6 +167,7 @@ def solve(task, model, env) -> None:
     units = plan(workspace, task.package)
     docs = {u.slug: doc_snippets(workspace, u) or "(no documentation found for this unit)" for u in units}
     specs = {u.slug: spec_view(workspace, u) for u in units}
+    design = {u.slug: hints(workspace, u) for u in units}   # boundary values and input classes, from the code
     log = {"project": task.project, "units": len(units), "steps": []}
     state = {"tests": 0, "stop": False, "errors": 0}
     kept_per_unit = {u.slug: 0 for u in units}
@@ -177,15 +183,20 @@ def solve(task, model, env) -> None:
             if kept_per_unit[unit.slug] >= MAX_KEPT_PER_UNIT:
                 return                 # this unit already has its share; spend the budget elsewhere
         focus = FOCUSES[(round_no - 1) % len(FOCUSES)]
+        black_box = round_no % 2 == 0   # even rounds: the writer sees the promises, not the (buggy) bodies
         rel = f"{task.new_tests_dir}/test_r{round_no}_{i:02d}_{unit.slug}.py"
         path = workspace / rel
         counter = UsageCounter(model)
         base = dict(project=task.project, package=task.package, summary=task.summary, unit=unit.name,
                     module=unit.module, file=unit.file, first_line=unit.first_line, last_line=unit.last_line,
-                    source=unit.source, docs=docs[unit.slug], spec=specs[unit.slug])
+                    source=specs[unit.slug] if black_box else unit.source, docs=docs[unit.slug], spec=specs[unit.slug],
+                    view=("signatures and docstrings only: the function bodies are hidden on purpose, so that you test "
+                          "what is promised, not what the (possibly buggy) code happens to do") if black_box else
+                         "the code (it may be buggy)",
+                    hints=design[unit.slug])
         with lock:
             already = "\n\n".join(kept_sources[unit.slug]) or "(none yet)"
-        entry = {"round": round_no, "unit": unit.name, "file": rel}
+        entry = {"round": round_no, "unit": unit.name, "file": rel, "black_box": black_box}
         trajectory = {}
         try:
             trajectory["write"] = write_unit(counter, env, prompts, base | {"focus": focus, "test_file": rel,
