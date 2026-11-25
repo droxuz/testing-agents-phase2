@@ -148,6 +148,37 @@ def _reply_text(model, messages) -> tuple[str, dict]:
             return "", message
 
 
+def _ask_blind(model, prompts: dict, base: dict, seed: int, questions: dict[str, dict],
+               control_questions: list[dict] | None) -> tuple[dict[str, str], list[str], dict]:
+    """One oracle call: questions and controls mixed, shuffled and given neutral labels.
+
+    Returns ({key: raw answer}, failed control keys, log with the controls and the messages)."""
+    asked = dict(questions)
+    for i, q in enumerate(control_questions or []):
+        asked[f"<control {i}>"] = q
+    order = sorted(asked)
+    random.Random(seed).shuffle(order)                  # controls are not always last
+    names = {f"snippet_{i}": key for i, key in enumerate(order, 1)}   # test names would leak the claim
+    snippets = "\n\n".join(f"### {name}\n```python\n{asked[key]['snippet']}\n```" for name, key in names.items())
+    messages = [
+        {"role": "system", "content": prompts["oracle_system_template"]},
+        {"role": "user", "content": Template(prompts["oracle_template"], undefined=StrictUndefined).render(
+            **base, snippets=snippets, names=", ".join(names))},
+    ]
+    reply, message = _reply_text(model, messages)
+    messages.append(message)
+    answers = {}
+    for name, value in ANSWER.findall(reply.replace("\\n", "\n")):
+        if name in names:
+            answers[names[name]] = value             # the last answer for a name wins
+    failed = [k for k in asked if k.startswith("<control")
+              and not (k in answers and agrees(asked[k]["kind"], asked[k]["expected"], answers[k]))]
+    log = {"controls": [{"snippet": q["snippet"], "expected": repr(q["expected"]),
+                         "answer": answers.get(f"<control {i}>")} for i, q in enumerate(control_questions or [])],
+           "messages": messages}
+    return {k: v for k, v in answers.items() if not k.startswith("<control")}, failed, log
+
+
 def predict(model, prompts: dict, base: dict, text: str, failing: dict[str, str],
             lines: dict[str, int], control_questions: list[dict] | None = None) -> tuple[set[str], set[str], dict]:
     """Return (keys whose blind prediction agrees, keys that could not be asked, log).
@@ -165,30 +196,10 @@ def predict(model, prompts: dict, base: dict, text: str, failing: dict[str, str]
                          for k, q in questions.items()}}
     if not questions:
         return set(), unasked, log
-    asked = dict(questions)
-    for i, q in enumerate(control_questions or []):
-        asked[f"<control {i}>"] = q
-    order = sorted(asked)
-    random.Random(len(text)).shuffle(order)             # controls are not always last
-    names = {f"snippet_{i}": key for i, key in enumerate(order, 1)}   # test names would leak the claim
-    snippets = "\n\n".join(f"### {name}\n```python\n{asked[key]['snippet']}\n```" for name, key in names.items())
-    messages = [
-        {"role": "system", "content": prompts["oracle_system_template"]},
-        {"role": "user", "content": Template(prompts["oracle_template"], undefined=StrictUndefined).render(
-            **base, snippets=snippets, names=", ".join(names))},
-    ]
-    reply, message = _reply_text(model, messages)
-    messages.append(message)
-    answers = {}
-    for name, value in ANSWER.findall(reply.replace("\\n", "\n")):
-        if name in names:
-            answers[names[name]] = value             # the last answer for a name wins
+    answers, failed_controls, call_log = _ask_blind(model, prompts, base, len(text), questions, control_questions)
+    messages = call_log.pop("messages")
     agreed = {k for k, q in questions.items() if k in answers and agrees(q["kind"], q["expected"], answers[k])}
-    failed_controls = [k for k in asked if k.startswith("<control")
-                       and not (k in answers and agrees(asked[k]["kind"], asked[k]["expected"], answers[k]))]
-    log |= {"controls": [{"snippet": q["snippet"], "expected": repr(q["expected"]),
-                          "answer": answers.get(f"<control {i}>")} for i, q in enumerate(control_questions or [])],
-            "failed_controls": failed_controls, "agreed_before_controls": sorted(agreed)}
+    log |= call_log | {"failed_controls": failed_controls, "agreed_before_controls": sorted(agreed)}
     if failed_controls:
         agreed = set()                                   # the oracle does not understand this area
     log |= {"answers": answers, "agreed": sorted(agreed), "messages": messages}
@@ -409,3 +420,99 @@ def controls(workspace, claim_sources: list[str], package: str, count: int = 2) 
     candidates = [c for c in candidates if c[1]["expected"] is not True]
     candidates.sort(key=lambda c: (c[0], c[1]["trivial"]))
     return [q for _, q in candidates[:count]]
+
+
+# ---------------------------------------------------------------------------------------------
+# Differential testing of the code against the blind oracle, on tests that PASS.
+#
+# The writer sees the (buggy) code and sometimes copies what it does into the test, so the test
+# passes and the bug it reached is thrown away. For passing tests we therefore also ask the blind
+# oracle (with controls) what the last checked value should be. If two independent answers agree
+# on a value that differs from what the code returns, the test is rewritten to assert the
+# oracle's value: it now fails on this code, and goes through the same triage as any claim.
+# Only exact values are used (`assert X == literal`), not yes/no questions.
+# ---------------------------------------------------------------------------------------------
+
+
+def passing_questions(text: str, keys, limit: int = 6) -> dict[str, dict]:
+    """{key: blind question about the last `assert X == literal` of each passing test}."""
+    tree = ast.parse(text)
+    found = {}
+    for key in sorted(keys):
+        func = _function(tree, key)
+        if func is None:
+            continue
+        for stmt in reversed([s for s in func.body if isinstance(s, ast.Assert)]):
+            q = question(text, key, stmt.lineno)
+            if q and q["kind"] == "value":
+                found[key] = q | {"line": stmt.lineno}
+                break
+        if len(found) >= limit:
+            break
+    return found
+
+
+def _strict_literal(answer: str):
+    try:
+        return True, ast.literal_eval(answer.strip().strip("`").strip())
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return False, None
+
+
+def differences(model, prompts: dict, base: dict, text: str, passing, control_questions: list[dict],
+                votes: int = 2) -> tuple[dict[str, dict], list[dict]]:
+    """Passing tests where `votes` blind answers agree on a value other than the code's.
+
+    Returns ({key: question with "proposed" value}, logs); nothing if a control is answered wrong."""
+    candidates = passing_questions(text, passing)
+    logs, proposed = [], {}
+    for vote in range(votes):
+        if not candidates:
+            break
+        answers, failed, log = _ask_blind(model, prompts, base, len(text) + vote, candidates, control_questions)
+        log["questions"] = {k: {"expected": repr(q["expected"]), "answer": answers.get(k)} for k, q in candidates.items()}
+        log["failed_controls"] = failed
+        logs.append(log)
+        if failed:                                       # the oracle does not understand this area
+            return {}, logs
+        kept = {}
+        for key, q in candidates.items():
+            ok, value = _strict_literal(answers.get(key, ""))
+            if not ok or value == q["expected"] or (type(value) is not type(q["expected"])
+                                                     and not isinstance(q["expected"], (int, float))):
+                continue                                 # no clear answer, or it agrees with the code
+            if vote == 0:
+                proposed[key] = value
+                kept[key] = q
+            elif proposed.get(key) == value:             # the second answer must be the same value
+                kept[key] = q
+        candidates = kept
+    return {k: q | {"proposed": proposed[k]} for k, q in candidates.items()}, logs
+
+
+def oracle_tests(text: str, chosen: dict[str, dict]) -> str:
+    """The test file with only the chosen tests, each asserting the oracle's value at its last assert."""
+    tree = ast.parse(text)
+    lines = text.splitlines(keepends=True)
+    edits = []
+    for key, q in chosen.items():
+        func = _function(tree, key)
+        stmt = next(s for s in func.body if isinstance(s, ast.Assert) and s.lineno == q["line"])
+        test = stmt.test
+        left_ok, _ = _literal(test.left)
+        expr = test.comparators[0] if left_ok else test.left
+        indent = " " * stmt.col_offset
+        new = f"{indent}assert {ast.unparse(expr)} == {q['proposed']!r}   # value the documentation implies\n"
+        edits.append((stmt.lineno - 1, func.end_lineno, new))          # drop what came after it
+    for start, end, new in sorted(edits, reverse=True):
+        lines[start:end] = [new]
+    out = "".join(lines)
+    from checks import remove_tests, test_sources           # keep only the rewritten tests
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as handle:
+        handle.write(out)
+    path = Path(handle.name)
+    remove_tests(path, set(test_sources(path)) - set(chosen))
+    result = path.read_text()
+    path.unlink()
+    return result

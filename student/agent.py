@@ -27,12 +27,17 @@ So the agent works like this, for each unit of code and in several rounds with d
    project's own tests correctly (oracle.controls: it has to show it understands this area).
    At the end, if the controls show the oracle is often wrong on this project (80% lower bound of
    its failure rate over 25%), the kept claims that never had a control are removed as well.
+6. Oracle differences (oracle.differences): the blind oracle is also asked about the last value
+   checked by tests that PASS. If two answers agree on a different value than the code returns,
+   the test is rewritten to assert the documented value and goes through triage as a new claim
+   (the writer sometimes copies a bug from the code into its test).
    (An earlier version then asked a KEEP/DROP reviewer, reviewer.py; on run oracle-r1 the reviewer
    dropped 39 real claims for 3 false alarms it caught, so it is off by default: TA_REVIEW=1.)
 
 Every model call goes through `model`, the harness's budgeted model.
 """
 
+import ast
 import json
 import math
 import os
@@ -51,7 +56,7 @@ from checks import (add_missing_imports, clock_params, real_clock_tests, undocum
                     test_sources, uncollectable_files)
 from hints import hints
 from planner import by_risk, doc_snippets, existing_tests, plan, spec_view
-from oracle import controls, predict
+from oracle import _function, controls, differences, oracle_tests, predict
 from reviewer import review
 
 MAX_QUERIES_PER_UNIT = 3      # model calls allowed to get the file written
@@ -65,6 +70,7 @@ MAX_KEPT_PER_UNIT = 3         # bug-claiming tests kept per unit over all rounds
 ORACLE_VOTES = int(os.environ.get("TA_ORACLE_VOTES", "2"))   # blind predictions that must all agree
 USE_REVIEW = os.environ.get("TA_REVIEW", "0") == "1"         # the KEEP/DROP reviewer (reviewer.py)
 CONTROLS = int(os.environ.get("TA_CONTROLS", "2"))           # known-answer questions per oracle call
+ORACLE_DIFF = os.environ.get("TA_DIFF", "0") == "1"         # oracle on passing tests: off, measured net harmful (diff-r1/r2)
 MAX_ERRORS = 6                # stop the project after this many failed units in a row
 FOCUSES = [
     "the documented behaviour: what the docstrings and docs above promise, and any `>>>` examples in them",
@@ -129,6 +135,7 @@ def triage(workspace: Path, test_file: Path, rel: str, package: str) -> tuple[di
     failing = {k: v for k, v in first.items()
                if v.startswith("assertion") and second.get(k) == v and k not in private}
     info["fail_lines"] = {k: lines[k] for k in failing if k in lines}
+    info["passing"] = sorted(k for k, v in first.items() if v == "passed" and second.get(k) == v and k not in private)
     return info, failing
 
 
@@ -212,6 +219,48 @@ def solve(task, model, env) -> None:
     kept_sources = {u.slug: [] for u in units}   # tests already kept, shown to later rounds of that unit
     lock = threading.Lock()
 
+    def differential(round_no, unit, rel, original, passing, base, counter, trajectory) -> dict | None:
+        """Ask the blind oracle about this file's passing tests; keep rewritten tests that now fail.
+
+        Has its own error handling: a failure here must not cost the unit's other claims."""
+        new_rel = rel[:-3] + "_oracle.py"
+        new_path = workspace / new_rel
+        with lock:
+            if kept_per_unit[unit.slug] >= MAX_KEPT_PER_UNIT or model.tokens_left < MIN_TOKENS_FOR_UNIT:
+                return None
+        step = {"round": round_no, "unit": unit.name, "kind": "oracle difference"}
+        try:
+            tree = ast.parse(original)
+            funcs = [_function(tree, k) for k in passing]
+            sources = [ast.get_source_segment(original, f) for f in funcs if f is not None]
+            evidence = existing_tests(workspace, sources)
+            context = base | {"existing": evidence or "(no existing tests use the same names)"}
+            known = controls(workspace, sources, task.package, CONTROLS) if CONTROLS else []
+            chosen, logs = differences(counter, prompts, context, original, passing, known, max(ORACLE_VOTES, 1))
+            trajectory["differences"] = logs
+            step |= {"asked": len(logs[0]["questions"]) if logs else 0,
+                     "calibrated": bool(logs and logs[0].get("controls")),
+                     "control_calls": sum(1 for g in logs if g.get("controls")),
+                     "control_fails": sum(1 for g in logs if g.get("controls") and g.get("failed_controls"))}
+            if not chosen:
+                return step
+            new_path.write_text(oracle_tests(original, chosen))
+            info, failing = triage(workspace, new_path, new_rel, task.package)
+            step |= {"file": new_rel, "proposed": {k: repr(q["proposed"]) for k, q in chosen.items()},
+                     "claims": sorted(failing), "dropped_file": info.get("dropped_file")}
+            keep = set(failing) & set(chosen)
+            with lock:
+                room = max(0, MAX_KEPT_PER_UNIT - kept_per_unit[unit.slug])
+                keep = set(sorted(keep)[:room])
+                kept_per_unit[unit.slug] += len(keep)
+            if new_path.exists():
+                step["kept"] = keep_only(workspace, new_path, new_rel, keep)
+                step["kept_tests"] = sorted(keep)
+            return step
+        except Exception as error:
+            new_path.unlink(missing_ok=True)
+            return step | {"error": f"{type(error).__name__}: {str(error)[:120]}", "kept": 0}
+
     def do_unit(round_no: int, i: int, unit) -> None:
         with lock:
             if (state["stop"] or model.tokens_left < MIN_TOKENS_FOR_UNIT
@@ -235,12 +284,14 @@ def solve(task, model, env) -> None:
         with lock:
             already = "\n\n".join(kept_sources[unit.slug]) or "(none yet)"
         entry = {"round": round_no, "unit": unit.name, "file": rel, "black_box": black_box}
-        trajectory = {}
+        trajectory, extra = {}, None
         try:
             trajectory["write"] = write_unit(counter, env, prompts, base | {"focus": focus, "test_file": rel,
                                                                        "already": already}, path)
             if path.exists():
                 info, failing = triage(workspace, path, rel, task.package)
+                original = path.read_text() if path.exists() else ""     # before keep_only trims it
+                passing = info.pop("passing", [])
                 entry |= info
                 entry["claims"] = sorted(failing)
                 kept = set()
@@ -283,6 +334,9 @@ def solve(task, model, env) -> None:
                         sources = test_sources(path)
                         with lock:
                             kept_sources[unit.slug] += [sources[k] for k in sorted(kept) if k in sources]
+                # Only after white-box rounds: a writer that never saw the code cannot have copied a bug.
+                if ORACLE_DIFF and original and passing and not black_box:
+                    extra = differential(round_no, unit, rel, original, passing, base, counter, trajectory)
             else:
                 entry["dropped_file"] = "never written"
         except Exception as error:     # budget used up, or a bad response from the API
@@ -297,8 +351,10 @@ def solve(task, model, env) -> None:
         with lock:
             if "dropped_file" not in entry or "Error" not in entry["dropped_file"]:
                 state["errors"] = 0    # count failed units in a row only
-            state["tests"] += entry.get("kept", 0)
+            state["tests"] += entry.get("kept", 0) + (extra or {}).get("kept", 0)
             log["steps"].append(entry)
+            if extra:
+                log["steps"].append(extra)
             total = state["tests"]
         (traj_dir / f"r{round_no}_{i:02d}_{unit.slug}.json").write_text(json.dumps(trajectory, indent=1, default=str))
         print(f"[{task.project}] round {round_no} unit {i + 1}/{len(units)} {unit.name}: {entry['tokens']} tokens, "
@@ -322,8 +378,8 @@ def solve(task, model, env) -> None:
         if calls >= 4 and _wilson_low(fails, calls) > DISTRUST_RATE:
             removed = []
             for e in log["steps"]:
-                path = workspace / e["file"]
-                if e.get("kept") and not e.get("calibrated") and path.exists():
+                path = workspace / (e.get("file") or "-")
+                if e.get("file") and e.get("kept") and not e.get("calibrated") and path.exists():
                     remove_tests(path, set(test_sources(path)))
                     path.unlink()
                     removed += [f"{e['file']}::{k}" for k in e.get("kept_tests", [])]

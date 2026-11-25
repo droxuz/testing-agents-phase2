@@ -292,16 +292,18 @@ def remove_tests(path: Path, keys: set[str]) -> int:
 
 
 def test_sources(path: Path) -> dict[str, str]:
-    """{"Class::test" or "test": source of that test function} for a test file."""
+    """{"Class::test" or "test": source} for the tests pytest collects in a file (functions named
+    test*, and test* methods of classes named Test*). Helper functions are not tests: removing
+    "every test except these" must leave them in place."""
     text = path.read_text()
     tree = ast.parse(text)
     found = {}
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
             found[node.name] = ast.get_source_segment(text, node)
-        elif isinstance(node, ast.ClassDef):
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
             for m in node.body:
-                if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and m.name.startswith("test"):
                     found[f"{node.name}::{m.name}"] = ast.get_source_segment(text, m)
     return found
 
