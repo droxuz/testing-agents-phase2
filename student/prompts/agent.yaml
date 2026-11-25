@@ -55,8 +55,9 @@ unit_template: |
     timer or similar function, pass your own fake one whose value you set explicitly between steps
     (for example `now = [0]`, `timer=lambda: now[0]`, then `now[0] = 5`); never one that changes
     each time it is called, because how often the code calls it is not documented.
-  - For eviction order, read items explicitly before the insert that evicts, so it is clear which
-    one was used least or most recently. Do not assume inserting or updating an item counts as a use.
+  - Do not rely on side effects the documentation does not state (for example, that one operation
+    also changes an order, a counter or some other state that a later operation depends on). Make
+    every step that matters explicit in the test.
   - Write `assert x in s` or `assert x not in s`, never `assert x in s is True` (in Python that
     means `x in s and s is True`, which is always False).
   - Do not import os, sys, inspect, pathlib, io or subprocess, and do not call open, eval or exec.
@@ -92,9 +93,9 @@ review_template: |
   test depends on a detail the documentation does not state, for example: the iteration or display
   order of items (unless the docs say how they are ordered), how many times a callback, timer or
   key function is called, the exact type or internal structure of a returned object, `repr` or
-  error message text, which item is chosen when several are equally valid, whether an item is
-  still valid at the exact instant it expires (unless the docs say "before" or "at"), or whether
-  inserting or updating an item counts as "using" it for an eviction policy (unless the docs say so).
+  error message text, which item is chosen when several are equally valid, what happens exactly at
+  a boundary the docs do not define (for example "before" versus "at" a limit), or a side effect of
+  an operation that the docs do not state.
 
   ## Documentation
 
@@ -170,9 +171,9 @@ oracle_template: |
 
   ## How to answer
 
-  For each snippet, trace it line by line and write down the state after each statement (for a
-  container: its full contents and order; for a cache: which items it holds and which one would be
-  evicted next). Then reply with ONE bash command that prints one line per snippet ({{names}}),
+  For each snippet, trace it line by line and write down the state after each statement (for any
+  object: all of its state that matters, for example the full contents and their order, and what
+  the next operation would do with it). Then reply with ONE bash command that prints one line per snippet ({{names}}),
   each a Python literal (or RAISES / NO where asked), like this:
 
   cat <<'EOF'

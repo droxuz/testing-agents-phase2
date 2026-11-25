@@ -63,7 +63,7 @@ def plan(workspace: Path, package: str) -> list[Unit]:
         module = ".".join(rel.with_suffix("").parts)
         if module.endswith(".__init__"):
             module = module[: -len(".__init__")]
-        text = path.read_text()
+        text = path.read_text(errors="replace")
         lines = text.splitlines()
         try:
             tree = ast.parse(text)
@@ -96,7 +96,18 @@ def plan(workspace: Path, package: str) -> list[Unit]:
                 source = _numbered(lines, start, header_end) + "\n    ...\n" + _numbered(lines, first, last)
                 units.append(Unit(label, _slug(label), module, str(rel), first, last,
                                   [g[0] for g in group], source))
-    return _merge_small(units)
+    return _unique_slugs(_merge_small(units))
+
+
+def _unique_slugs(units: list[Unit]) -> list[Unit]:
+    """Slugs key per-unit state and file names, so two units (e.g. classes with the same name in
+    different modules) must not share one."""
+    seen = {}
+    for unit in units:
+        base = unit.slug or "unit"
+        seen[base] = seen.get(base, 0) + 1
+        unit.slug = base if seen[base] == 1 else f"{base}_{seen[base]}"
+    return units
 
 
 def _merge_small(units: list[Unit]) -> list[Unit]:
@@ -116,6 +127,19 @@ def _merge_small(units: list[Unit]) -> list[Unit]:
     return merged
 
 
+DOC_SUFFIXES = {".rst", ".md", ".txt", ".markdown"}
+
+
+def doc_files(root: Path) -> list[Path]:
+    """The project's documentation: README* at the top, and every text document under docs/ or doc/."""
+    root = Path(root)
+    files = sorted(p for p in root.glob("README*") if p.is_file())
+    for folder in ("docs", "doc"):
+        if (root / folder).is_dir():
+            files += sorted(p for p in (root / folder).rglob("*") if p.suffix.lower() in DOC_SUFFIXES and p.is_file())
+    return files
+
+
 def doc_snippets(workspace: Path, unit: Unit, max_lines: int = 80) -> str:
     """Paragraphs of README.rst and docs/ that mention the unit's classes or functions.
 
@@ -127,8 +151,7 @@ def doc_snippets(workspace: Path, unit: Unit, max_lines: int = 80) -> str:
     if not names:
         return ""
     pattern = re.compile(r"\b(" + "|".join(sorted(map(re.escape, names))) + r")\b")
-    docs = [p for p in [root / "README.rst", root / "README.md"] if p.exists()]
-    docs += sorted((root / "docs").rglob("*.rst")) if (root / "docs").is_dir() else []
+    docs = doc_files(root)
     scored, seen = [], set()
     for order, path in enumerate(docs):
         for para in re.split(r"\n\s*\n", path.read_text(errors="replace")):
@@ -223,3 +246,41 @@ def existing_tests(workspace: Path, test_sources: list[str], max_lines: int = 90
         picked.append(source)
         used += n
     return "\n\n".join(picked)
+
+
+def risk(workspace: Path, unit: Unit) -> float:
+    """How many places a small bug could be in, per unit: comparisons, arithmetic, boolean logic,
+    negations and integer constants in the unit's code, the kinds of mistakes the bugs are.
+
+    Private modules and classes (leading underscore) count less: they are reached only through
+    the public API, and their behaviour is less often documented."""
+    try:
+        tree = ast.parse((Path(workspace) / unit.file).read_text(errors="replace"))
+    except (SyntaxError, OSError):
+        return 0.0
+    wanted, bodies = set(unit.members), []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted:
+            bodies.append(node)
+        elif isinstance(node, ast.ClassDef):
+            bodies += [m for m in node.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+                       and f"{node.name}.{m.name}" in wanted]
+    points = 0
+    for node in (n for body in bodies for n in ast.walk(body)):
+        if isinstance(node, ast.Compare):
+            points += len(node.ops)
+        elif isinstance(node, (ast.BinOp, ast.AugAssign, ast.BoolOp)):
+            points += 1
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.Not, ast.USub)):
+            points += 1
+        elif isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+            points += 1
+    private = any(part.startswith("_") and part != "__init__" for part in unit.module.split(".")) or \
+        all(m.split(".")[0].startswith("_") for m in unit.members)
+    return points * (0.3 if private else 1.0)
+
+
+def by_risk(workspace: Path, units: list[Unit]) -> list[Unit]:
+    """Units in the order to test them when the budget may not reach all of them (risk-based test
+    prioritisation): the most bug-prone first."""
+    return sorted(units, key=lambda u: -risk(workspace, u))

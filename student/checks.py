@@ -134,7 +134,7 @@ def _package_names(workspace: Path, package: str) -> dict[str, dict[str, set[str
         module = ".".join(file.relative_to(workspace).with_suffix("").parts)
         module = module[: -len(".__init__")] if module.endswith(".__init__") else module
         try:
-            tree = ast.parse(file.read_text())
+            tree = ast.parse(file.read_text(errors="replace"))
         except SyntaxError:
             continue
         defined = set()
@@ -345,3 +345,130 @@ def uncollectable_files(workspace: Path, folder: str, timeout: int = 110) -> lis
     except subprocess.TimeoutExpired:
         return []
     return sorted(set(re.findall(r"^ERROR (\S+\.py)", result.stdout, re.M)))
+
+
+CLOCK_PARAMS = {"timer", "clock", "time_func", "timefunc", "now"}
+
+
+def clock_params(workspace: Path, package: str) -> dict[str, str]:
+    """{name: clock parameter} for package classes (via __init__) and functions that take a clock."""
+    found = {}
+    for file in sorted((Path(workspace) / package).rglob("*.py")):
+        try:
+            tree = ast.parse(file.read_text(errors="replace"))
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            funcs = [node] if isinstance(node, ast.FunctionDef) else [
+                m for m in getattr(node, "body", []) if isinstance(m, ast.FunctionDef) and m.name == "__init__"]
+            for f in funcs:
+                params = {a.arg for a in f.args.args + f.args.kwonlyargs} & CLOCK_PARAMS
+                if params and isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                    found[node.name] = sorted(params)[0]
+    return found
+
+
+def real_clock_tests(path: Path, clocks: dict[str, str]) -> set[str]:
+    """Tests that call something taking a clock parameter without passing one: they depend on the
+    real time, so their result is not determined by the docs (and may change between runs)."""
+    tree = ast.parse(path.read_text())
+
+    def uses_real_clock(func) -> bool:
+        for n in ast.walk(func):
+            if isinstance(n, ast.Call):
+                name = n.func.id if isinstance(n.func, ast.Name) else getattr(n.func, "attr", None)
+                if name in clocks:
+                    given = {k.arg for k in n.keywords}
+                    if clocks[name] not in given and None not in given and len(n.args) < 3:
+                        return True
+        return False
+
+    found = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and uses_real_clock(node):
+            found.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            for m in node.body:
+                if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and uses_real_clock(m):
+                    found.add(f"{node.name}::{m.name}")
+    return found
+
+
+def documented_names(workspace: Path, package: str) -> set[str] | None:
+    """Public top-level names of the package that the documentation mentions, or None if the docs
+    mention too few of them (under 30%) to judge by: then every name counts as documented."""
+    from planner import doc_files
+    public = set()
+    for module in _package_names(workspace, package).values():
+        public |= {n for n in module if not n.startswith("_")}
+    tree_names = set()
+    for file in sorted((Path(workspace) / package).rglob("*.py")):
+        try:
+            tree = ast.parse(file.read_text(errors="replace"))
+        except SyntaxError:
+            continue
+        tree_names |= {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))
+                       and not n.name.startswith("_")}
+    public &= tree_names                         # defined here, not names the package imports
+    text = "\n".join(p.read_text(errors="replace") for p in doc_files(workspace))
+    mentioned = {n for n in public if re.search(r"\b" + re.escape(n) + r"\b", text)}
+    if not public or len(mentioned) < 0.3 * len(public):
+        return None
+    return mentioned
+
+
+def undocumented_tests(path: Path, package: str, documented: set[str] | None, defined: set[str]) -> set[str]:
+    """Tests that use a public package name the documentation never mentions. Nothing can decide
+    what such code should return (the test oracle problem), so a failure there is no evidence of a bug."""
+    if documented is None:
+        return set()
+    tree = ast.parse(path.read_text())
+    from_package = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == package:
+            from_package |= {a.asname or a.name for a in node.names}
+        elif isinstance(node, ast.Import):
+            from_package |= {a.asname or a.name for a in node.names if a.name.split(".")[0] == package}
+
+    def uses_undocumented(func) -> bool:
+        for n in ast.walk(func):
+            name = n.id if isinstance(n, ast.Name) and n.id in from_package else (
+                n.attr if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                and n.value.id in from_package and n.value.id not in defined else None)
+            if name and name in defined and not name.startswith("_") and name not in documented:
+                return True
+        return False
+
+    found = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and uses_undocumented(node):
+            found.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            for m in node.body:
+                if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and uses_undocumented(m):
+                    found.add(f"{node.name}::{m.name}")
+    return found
+
+
+def defined_names(workspace: Path, package: str) -> set[str]:
+    """Public classes and functions defined (not just imported) in the package's modules."""
+    names = set()
+    for file in sorted((Path(workspace) / package).rglob("*.py")):
+        try:
+            tree = ast.parse(file.read_text(errors="replace"))
+        except SyntaxError:
+            continue
+        names |= {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+    return names
+
+
+_DOC_CACHE: dict = {}
+
+
+def undocumented_claims(workspace: Path, path: Path, package: str) -> set[str]:
+    """undocumented_tests with the project-level part (docs, defined names) computed once."""
+    key = (str(workspace), package)
+    if key not in _DOC_CACHE:
+        _DOC_CACHE[key] = (documented_names(workspace, package), defined_names(workspace, package))
+    documented, defined = _DOC_CACHE[key]
+    return undocumented_tests(path, package, documented, defined)

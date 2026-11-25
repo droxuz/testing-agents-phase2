@@ -8,7 +8,7 @@ Two lecture techniques, done in Python and given to the test writer as concrete 
 - Equivalence partitioning: (a) from the code's own branches on a parameter (`x is None`,
   `callable(x)`, `isinstance(x, T)`, `x < 0`, ...), each branch is an input class worth a test;
   (b) from each parameter's name and default, the input classes worth one test each (negative
-  indexes, equal keys for a key function, the exact expiry instant for a timer, ...).
+  indexes, equal keys for a key function, times well before and after an expiry, ...).
 
 And one form of specification mining / differential testing:
 
@@ -21,6 +21,8 @@ import ast
 import re
 from pathlib import Path
 
+from planner import doc_files
+
 SIGNATURE_LINE = re.compile(r"^\s*(?:\.\. [\w:]+:: )?(?:[\w]+\.)*(\w+)\((.*)\)\s*$")
 
 ROLES = [   # (parameter-name pattern, input classes to cover)
@@ -32,7 +34,8 @@ ROLES = [   # (parameter-name pattern, input classes to cover)
      "or key=lambda x: x // 10), duplicates of the same key, and key=None"),
     (r"^(maxsize|size|capacity|max_size|limit|n|count|load)$", "0, 1, a small number, and the default value"),
     (r"^(ttl|ttu|timer|time|now|timeout|expires?)$",
-     "a fake timer you set explicitly; check just before, exactly at, and just after an expiry time"),
+     "a fake timer you set explicitly; check well before and well after an expiry time (not the exact "
+     "instant, which the docs rarely define)"),
     (r"^(reverse|inclusive|typed|strict)$", "both True and False"),
     (r"^(default|fill|fillvalue)$", "leaving it out, and passing a value"),
     (r"^(minimum|maximum|min|max|lo|hi|low|high|lower|upper)$",
@@ -126,8 +129,7 @@ def _constants(tree: ast.Module, classes: set[str]) -> list[str]:
 def _documented_signatures(workspace: Path) -> dict[str, list[str]]:
     """{function name: [argument text of each signature line in the docs]}."""
     root = Path(workspace)
-    paths = [p for p in [root / "README.rst", root / "README.md"] if p.exists()]
-    paths += sorted((root / "docs").rglob("*.rst")) if (root / "docs").is_dir() else []
+    paths = doc_files(root)
     found: dict[str, list[str]] = {}
     for path in paths:
         for line in path.read_text(errors="replace").splitlines():

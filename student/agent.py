@@ -10,6 +10,7 @@ What we learned from the starter agent and from our first versions (runs units-r
 
 So the agent works like this, for each unit of code and in several rounds with different focuses:
 1. Plan (Python, planner.py, hints.py): split the package into units of at most ~220 source lines,
+   order them by risk (how many comparisons, constants and operators a small bug could be in),
    find the documentation paragraphs about each unit, and compute test design hints from the code:
    boundary values from its constants and defaults, and input classes from its branches and
    parameters (boundary value analysis and equivalence partitioning).
@@ -21,7 +22,11 @@ So the agent works like this, for each unit of code and in several rounds with d
    remain: each one claims to have found a bug.
 4. Blind oracle (model, oracle.py): each failing test is cut off before its failing assert, and
    model calls that see only the docs, signatures and the project's own tests predict the value.
-   A claim is kept only if ORACLE_VOTES independent predictions all agree with the test.
+   A claim is kept only if ORACLE_VOTES independent predictions all agree with the test, and only
+   if, in the same calls, the oracle also answers known-answer control questions from the
+   project's own tests correctly (oracle.controls: it has to show it understands this area).
+   At the end, if the controls show the oracle is often wrong on this project (80% lower bound of
+   its failure rate over 25%), the kept claims that never had a control are removed as well.
    (An earlier version then asked a KEEP/DROP reviewer, reviewer.py; on run oracle-r1 the reviewer
    dropped 39 real claims for 3 false alarms it caught, so it is off by default: TA_REVIEW=1.)
 
@@ -29,6 +34,7 @@ Every model call goes through `model`, the harness's budgeted model.
 """
 
 import json
+import math
 import os
 import sys
 import threading
@@ -41,11 +47,11 @@ import yaml
 from jinja2 import StrictUndefined, Template
 from minisweagent.exceptions import FormatError, LimitsExceeded
 
-from checks import (add_missing_imports, drop_unparsable_tests, fix_chained_comparisons, fix_imports, private_name_tests, rejection_reason, remove_tests, run_tests,
+from checks import (add_missing_imports, clock_params, real_clock_tests, undocumented_claims, drop_unparsable_tests, fix_chained_comparisons, fix_imports, private_name_tests, rejection_reason, remove_tests, run_tests,
                     test_sources, uncollectable_files)
 from hints import hints
-from planner import doc_snippets, existing_tests, plan, spec_view
-from oracle import predict
+from planner import by_risk, doc_snippets, existing_tests, plan, spec_view
+from oracle import controls, predict
 from reviewer import review
 
 MAX_QUERIES_PER_UNIT = 3      # model calls allowed to get the file written
@@ -58,6 +64,7 @@ MAX_KEPT_PER_UNIT = 3         # bug-claiming tests kept per unit over all rounds
 # ablation runs for the report can switch a technique off (docker run -e TA_ORACLE_VOTES=0 ...).
 ORACLE_VOTES = int(os.environ.get("TA_ORACLE_VOTES", "2"))   # blind predictions that must all agree
 USE_REVIEW = os.environ.get("TA_REVIEW", "0") == "1"         # the KEEP/DROP reviewer (reviewer.py)
+CONTROLS = int(os.environ.get("TA_CONTROLS", "2"))           # known-answer questions per oracle call
 MAX_ERRORS = 6                # stop the project after this many failed units in a row
 FOCUSES = [
     "the documented behaviour: what the docstrings and docs above promise, and any `>>>` examples in them",
@@ -114,6 +121,11 @@ def triage(workspace: Path, test_file: Path, rel: str, package: str) -> tuple[di
     info["flaky"] = sum(second.get(k) != v for k, v in first.items())
     private = private_name_tests(test_file, package)
     info["private"] = len(private)
+    real_clock = real_clock_tests(test_file, clock_params(workspace, package))
+    info["real_clock"] = len(real_clock)
+    undocumented = undocumented_claims(workspace, test_file, package)   # no spec, so no oracle for it
+    info["undocumented"] = len(undocumented)
+    private |= real_clock | undocumented
     failing = {k: v for k, v in first.items()
                if v.startswith("assertion") and second.get(k) == v and k not in private}
     info["fail_lines"] = {k: lines[k] for k in failing if k in lines}
@@ -157,6 +169,26 @@ class UsageCounter:
         return getattr(self._model, name)
 
 
+DISTRUST_RATE = 0.25   # distrust a project's unchecked claims if the oracle fails more than this...
+CONFIDENCE_Z = 1.2816  # ...with 80% confidence (one-sided Wilson lower bound)
+
+
+def _wilson_low(failures: int, n: int, z: float = CONFIDENCE_Z) -> float:
+    """Lower confidence bound of a failure rate: small samples get the benefit of the doubt."""
+    if n == 0:
+        return 0.0
+    p = failures / n
+    return (p + z * z / (2 * n) - z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / (1 + z * z / n)
+
+
+def _safe(function, *args):
+    """function(*args), or "" if it raises."""
+    try:
+        return function(*args)
+    except Exception:
+        return ""
+
+
 def solve(task, model, env) -> None:
     student = Path(task.student_dir)
     prompts = yaml.safe_load((student / "prompts" / "agent.yaml").read_text())
@@ -164,10 +196,16 @@ def solve(task, model, env) -> None:
     traj_dir = Path(task.trajectory_path).parent / "units"
     traj_dir.mkdir(parents=True, exist_ok=True)
 
-    units = plan(workspace, task.package)
-    docs = {u.slug: doc_snippets(workspace, u) or "(no documentation found for this unit)" for u in units}
-    specs = {u.slug: spec_view(workspace, u) for u in units}
-    design = {u.slug: hints(workspace, u) for u in units}   # boundary values and input classes, from the code
+    # Unknown projects can have files our helpers do not expect: a failure here must cost one unit's
+    # extras, never the whole project.
+    try:
+        units = by_risk(workspace, plan(workspace, task.package))   # most bug-prone first: budget may run out
+    except Exception as error:
+        print(f"[{task.project}] planning failed ({type(error).__name__}: {error}); no units", flush=True)
+        units = []
+    docs = {u.slug: _safe(doc_snippets, workspace, u) or "(no documentation found for this unit)" for u in units}
+    specs = {u.slug: _safe(spec_view, workspace, u) or u.source for u in units}
+    design = {u.slug: _safe(hints, workspace, u) or "(no computed hints for this unit)" for u in units}
     log = {"project": task.project, "units": len(units), "steps": []}
     state = {"tests": 0, "stop": False, "errors": 0}
     kept_per_unit = {u.slug: 0 for u in units}
@@ -211,15 +249,22 @@ def solve(task, model, env) -> None:
                     evidence = existing_tests(workspace, [sources[k] for k in failing if k in sources])
                     context = base | {"existing": evidence or "(no existing tests use the same names)"}
                     fail_lines = entry.pop("fail_lines")
+                    known = controls(workspace, [sources[k] for k in failing if k in sources], task.package,
+                                     CONTROLS) if CONTROLS else []
                     agreed, unasked, trajectory["oracle"] = set(failing), set(), []
                     for _ in range(ORACLE_VOTES):     # independent blind predictions; all must agree
                         asked = {k: v for k, v in failing.items() if k in agreed}
                         if not asked:
                             break
                         agreed, still_unasked, oracle_log = predict(counter, prompts, context,
-                                                                    path.read_text(), asked, fail_lines)
+                                                                    path.read_text(), asked, fail_lines, known)
+                        entry.setdefault("failed_controls", []).append(len(oracle_log.get("failed_controls", [])))
+                        if oracle_log.get("controls"):     # one calibration sample for the whole project
+                            entry["control_calls"] = entry.get("control_calls", 0) + 1
+                            entry["control_fails"] = entry.get("control_fails", 0) + bool(oracle_log["failed_controls"])
                         unasked |= still_unasked
                         trajectory["oracle"].append(oracle_log)
+                    entry["calibrated"] = bool(trajectory["oracle"] and trajectory["oracle"][0].get("controls"))
                     entry["oracle_agreed"], entry["oracle_unasked"] = sorted(agreed), sorted(unasked)
                     if USE_REVIEW:            # claims the oracle could not ask about go to the reviewer too
                         survivors = {k: v for k, v in failing.items() if k in agreed | unasked}
@@ -267,10 +312,35 @@ def solve(task, model, env) -> None:
             if state["stop"]:
                 break
 
+    # Project-level calibration: the control questions measured how often the oracle is wrong on
+    # this project. If we are fairly sure it is often wrong, the claims that were never checked
+    # against a control are not trusted either.
+    try:
+        calls = sum(e.get("control_calls", 0) for e in log["steps"])
+        fails = sum(e.get("control_fails", 0) for e in log["steps"])
+        log["calibration"] = {"control_calls": calls, "failed": fails, "lower_bound": round(_wilson_low(fails, calls), 3)}
+        if calls >= 4 and _wilson_low(fails, calls) > DISTRUST_RATE:
+            removed = []
+            for e in log["steps"]:
+                path = workspace / e["file"]
+                if e.get("kept") and not e.get("calibrated") and path.exists():
+                    remove_tests(path, set(test_sources(path)))
+                    path.unlink()
+                    removed += [f"{e['file']}::{k}" for k in e.get("kept_tests", [])]
+            log["calibration"]["removed_uncalibrated"] = removed
+            state["tests"] -= len(removed)
+            print(f"[{task.project}] oracle failed {fails}/{calls} control calls: removed {len(removed)} "
+                  "claims that had no control", flush=True)
+    except Exception as error:
+        log["calibration_error"] = f"{type(error).__name__}: {error}"
+
     # One file that pytest cannot collect stops the whole measured run, so check the folder as a whole.
-    for bad in uncollectable_files(workspace, task.new_tests_dir):
-        (workspace / bad).unlink(missing_ok=True)
-        log.setdefault("removed_uncollectable", []).append(bad)
+    try:
+        for bad in uncollectable_files(workspace, task.new_tests_dir):
+            (workspace / bad).unlink(missing_ok=True)
+            log.setdefault("removed_uncollectable", []).append(bad)
+    except Exception as error:
+        log["cleanup_error"] = f"{type(error).__name__}: {error}"
     log["tokens_used"] = model.total_tokens
     log["total_tests"] = state["tests"]
     Path(task.trajectory_path).write_text(json.dumps(log, indent=2))
