@@ -27,8 +27,7 @@ instance_template: |
 
   ## Suggested approach
 
-  1. Read the README and list the public classes and functions.
-  2. For each one, read its docstring and code, and note what it promises.
+  1. Run `extract_spec{{package}}` to get every functions signature, docstring and claims. Read the results instead of the whole source files
   3. Write tests for those promises, especially boundaries and edge cases.
   4. Run your tests with `python -m pytest -q {{new_tests_dir}}`. A failing test is either a bug you found
      or a mistake in your test: check the documentation again before keeping it.
