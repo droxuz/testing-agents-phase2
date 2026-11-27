@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+"""sbst: search-based test input generation. Finds inputs that reach each branch and boundary of a target.
+
+Usage: sbst --list                 classes and functions with their number of branches
+       sbst TARGET [--budget S] [--cases N] [--line N] [--seed N]
+
+TARGET is a function, a class or Class.method, e.g. LRUCache, LRUCache.popitem, SortedList.add.
+The search runs call sequences on the current code. It is guided by branch coverage and branch distance
+(how close a comparison came to flipping), and aims for every if/while/for/except outcome and for each
+numeric comparison exactly at its boundary (a == b) and one off (a - b = -1, +1).
+
+Prints, for each case: the goals it reaches, the code, and what the CURRENT code returned. Then the spec
+claims extract_spec found for the target (step 1). The current code may be buggy: take the expected
+value from the spec, never from the observed value. If they disagree, the spec wins (a likely bug).
+
+Options:
+  --budget S   seconds to search (default 20)
+  --cases N    most cases to print (default 8)
+  --line N     only goals on source line N (shows every case for that line)
+  --seed N     random seed (default 1)
+  --package P  package to test (default: auto-detect)
+"""
+
+import argparse
+import ast
+import inspect
+import random
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _searchlib as lib  # noqa: E402
+
+K = 1.0
+NUMBER = (int, float)
+
+
+class Unsafe(Exception):
+    """An expression the tracer will not evaluate, since it could run code or change state."""
+
+
+SAFE_CONTAINERS = (list, tuple, dict, set, frozenset, str, bytes, range)
+SAFE_FUNCS = {"len", "abs", "min", "max"}
+
+
+def static_attr(obj, name):
+    """getattr without running properties or other code from the project."""
+    try:
+        value = inspect.getattr_static(obj, name)
+    except AttributeError:
+        raise Unsafe(name)
+    kind = type(value).__name__
+    if kind in ("member_descriptor", "getset_descriptor"):
+        return getattr(obj, name)
+    if isinstance(value, (property, staticmethod, classmethod)) or hasattr(type(value), "__get__"):
+        raise Unsafe(name)
+    return value
+
+
+def safe_eval(node, frame):
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        for space in (frame.f_locals, frame.f_globals, frame.f_builtins):
+            if node.id in space:
+                return space[node.id]
+        raise Unsafe(node.id)
+    if isinstance(node, ast.Attribute):
+        return static_attr(safe_eval(node.value, frame), node.attr)
+    if isinstance(node, ast.UnaryOp):
+        value = safe_eval(node.operand, frame)
+        if isinstance(node.op, ast.Not) and isinstance(value, (bool, NUMBER, type(None), *SAFE_CONTAINERS)):
+            return not value
+        if isinstance(value, NUMBER):
+            return -value if isinstance(node.op, ast.USub) else +value
+        raise Unsafe("unary")
+    if isinstance(node, ast.BinOp):
+        a, b = safe_eval(node.left, frame), safe_eval(node.right, frame)
+        if isinstance(a, NUMBER) and isinstance(b, NUMBER):
+            ops = {ast.Add: lambda: a + b, ast.Sub: lambda: a - b, ast.Mult: lambda: a * b,
+                   ast.FloorDiv: lambda: a // b, ast.Mod: lambda: a % b, ast.Div: lambda: a / b}
+            if type(node.op) in ops:
+                return ops[type(node.op)]()
+        raise Unsafe("binop")
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in SAFE_FUNCS \
+            and not node.keywords and len(node.args) == 1:
+        value = safe_eval(node.args[0], frame)
+        if node.func.id == "abs" and isinstance(value, NUMBER):
+            return abs(value)
+        if type(value) in SAFE_CONTAINERS:
+            return {"len": len, "min": min, "max": max, "abs": abs}[node.func.id](value)
+        raise Unsafe("call")
+    if isinstance(node, ast.Subscript):
+        base = safe_eval(node.value, frame)
+        if type(base) in SAFE_CONTAINERS and not isinstance(node.slice, ast.Slice):
+            return base[safe_eval(node.slice, frame)]
+        raise Unsafe("subscript")
+    raise Unsafe(type(node).__name__)
+
+
+def compare(op, a, b):
+    if isinstance(op, (ast.In, ast.NotIn)):
+        if type(b) not in SAFE_CONTAINERS:
+            raise Unsafe("in")
+        result = a in b
+        return result if isinstance(op, ast.In) else not result
+    if isinstance(op, ast.Is):
+        return a is b
+    if isinstance(op, ast.IsNot):
+        return a is not b
+    if not (isinstance(a, (NUMBER, str, type(None), bool)) and isinstance(b, (NUMBER, str, type(None), bool))):
+        raise Unsafe("compare")
+    return {ast.Lt: lambda: a < b, ast.LtE: lambda: a <= b, ast.Gt: lambda: a > b, ast.GtE: lambda: a >= b,
+            ast.Eq: lambda: a == b, ast.NotEq: lambda: a != b}[type(op)]()
+
+
+def norm(d):
+    return d / (d + 1.0)
+
+
+def distance(node, frame):
+    """(distance to true, distance to false) of a condition, in [0, 1]. Raises Unsafe."""
+    if isinstance(node, ast.BoolOp):
+        parts = [distance(v, frame) for v in node.values]
+        if isinstance(node.op, ast.And):
+            return norm(sum(t for t, _ in parts)), min(f for _, f in parts)
+        return min(t for t, _ in parts), norm(sum(f for _, f in parts))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        t, f = distance(node.operand, frame)
+        return f, t
+    if isinstance(node, ast.Compare):
+        values = [safe_eval(node.left, frame)] + [safe_eval(c, frame) for c in node.comparators]
+        t_sum, f_min = 0.0, 1.0
+        for op, a, b in zip(node.ops, values, values[1:]):
+            t, f = pair_distance(op, a, b)
+            t_sum += t
+            f_min = min(f_min, f)
+        return norm(t_sum) if len(node.ops) > 1 else t_sum, f_min
+    value = safe_eval(node, frame)
+    if not isinstance(value, (bool, NUMBER, type(None), *SAFE_CONTAINERS)):
+        raise Unsafe("truth")
+    return (0.0, 1.0) if value else (1.0, 0.0)
+
+
+def pair_distance(op, a, b):
+    if isinstance(a, NUMBER) and isinstance(b, NUMBER) and not isinstance(op, (ast.In, ast.NotIn, ast.Is, ast.IsNot)):
+        lt, le, eq = (lambda: (0.0 if a < b else norm(a - b + K))), (lambda: (0.0 if a <= b else norm(a - b))), \
+            (lambda: (0.0 if a == b else norm(abs(a - b))))
+        gt = lambda: 0.0 if a > b else norm(b - a + K)
+        ge = lambda: 0.0 if a >= b else norm(b - a)
+        ne = lambda: 0.0 if a != b else norm(K)
+        table = {ast.Lt: (lt, ge), ast.LtE: (le, gt), ast.Gt: (gt, le), ast.GtE: (ge, lt),
+                 ast.Eq: (eq, ne), ast.NotEq: (ne, eq)}
+        t, f = table[type(op)]
+        return t(), f()
+    return (0.0, 1.0) if compare(op, a, b) else (1.0, 0.0)
+
+
+# ---------------------------------------------------------------------------------------- goals
+@dataclass
+class Goal:
+    gid: int
+    file: str
+    line: int
+    kind: str        # branch or boundary
+    label: str       # TRUE, FALSE, entered, skipped, handler, "a == b", ...
+    text: str        # the condition's source
+    scope: str
+    check: tuple = ()  # how to decide coverage from lines and arcs
+    witness: object = None
+    best: float = 2.0
+    best_ind: object = None
+
+    def title(self):
+        if self.kind == "boundary":
+            return f"L{self.line} boundary `{self.text}` at {self.label}"
+        return f"L{self.line} `{self.text}` -> {self.label}"
+
+
+@dataclass
+class Probe:
+    """A condition evaluated when its line runs: gives distances, if-expression outcomes and boundaries."""
+    node: ast.AST
+    true_goal: Goal | None = None
+    false_goal: Goal | None = None
+    covers_outcome: bool = False     # an if-expression: the evaluation itself decides coverage
+    boundaries: list = field(default_factory=list)   # (left, right, {diff: Goal})
+
+
+def mangle(tree, cls_name):
+    """Apply private name mangling (self.__x -> self._Cls__x) so names match the running code."""
+    if not cls_name:
+        return tree
+    prefix = "_" + cls_name.lstrip("_")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr.startswith("__") and not node.attr.endswith("__"):
+            node.attr = prefix + node.attr
+        elif isinstance(node, ast.Name) and node.id.startswith("__") and not node.id.endswith("__"):
+            node.id = prefix + node.id
+    return tree
+
+
+def short(node, limit=60):
+    text = " ".join(ast.unparse(node).split())
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+class GoalBuilder:
+    def __init__(self):
+        self.goals, self.probes = [], {}   # probes: (file, line) -> [Probe]
+        self.for_goals = []                # (file, for_line, body_first, goal)
+
+    def goal(self, file, line, kind, label, text, scope, check=()):
+        g = Goal(len(self.goals), file, line, kind, label, text, scope, check)
+        self.goals.append(g)
+        return g
+
+    def probe(self, file, line, probe):
+        self.probes.setdefault((file, line), []).append(probe)
+
+    def boundaries(self, file, line, original, test, scope, probe):
+        for shown, node in zip(ast.walk(original), ast.walk(test)):  # same shape: labels use the source names
+            if isinstance(node, ast.Compare) and len(node.ops) == 1 and \
+                    isinstance(node.ops[0], (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq)):
+                if any(isinstance(side, ast.Constant) and not isinstance(side.value, NUMBER)
+                       for side in (node.left, node.comparators[0])):
+                    continue
+                left, right = short(shown.left, 30), short(shown.comparators[0], 30)
+                goals = {d: self.goal(file, line, "boundary",
+                                      f"{left} == {right}" if d == 0 else f"{left} == {right} {'+' if d > 0 else '-'} 1",
+                                      short(shown), scope) for d in (0, -1, 1)}
+                probe.boundaries.append((node.left, node.comparators[0], goals))
+
+    def function(self, file, fnode, scope, cls_name):
+        for node in walk_own(fnode):
+            if isinstance(node, (ast.If, ast.While)):
+                test = mangle(ast.parse(ast.unparse(node.test), mode="eval").body, cls_name)
+                const = isinstance(node.test, ast.Constant)
+                lines = tuple(range(node.test.lineno, node.test.end_lineno + 1))
+                body = node.body[0].lineno
+                text = short(node.test)
+                probe = Probe(test)
+                if not const:
+                    probe.true_goal = self.goal(file, node.lineno, "branch", "TRUE", text, scope, ("line", body))
+                    other = ("line", node.orelse[0].lineno) if node.orelse else ("exit", lines, body)
+                    probe.false_goal = self.goal(file, node.lineno, "branch", "FALSE", text, scope, other)
+                self.boundaries(file, node.lineno, node.test, test, scope, probe)
+                self.probe(file, node.test.lineno, probe)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                body = node.body[0].lineno
+                text = f"for {short(node.target, 20)} in {short(node.iter, 30)}"
+                self.goal(file, node.lineno, "branch", "loop body runs", text, scope, ("line", body))
+                g = self.goal(file, node.lineno, "branch", "loop runs 0 times", text, scope, ("for0",))
+                self.for_goals.append((file, node.lineno, body, g))
+            elif isinstance(node, ast.Try):
+                for handler in node.handlers:
+                    name = short(handler.type, 30) if handler.type else "anything"
+                    self.goal(file, handler.lineno, "branch", "handler runs", f"except {name}", scope,
+                              ("line", handler.body[0].lineno))
+            elif isinstance(node, ast.IfExp):
+                test = mangle(ast.parse(ast.unparse(node.test), mode="eval").body, cls_name)
+                text = short(node.test)
+                probe = Probe(test, covers_outcome=True)
+                probe.true_goal = self.goal(file, node.lineno, "branch", "TRUE (if-expression)", text, scope)
+                probe.false_goal = self.goal(file, node.lineno, "branch", "FALSE (if-expression)", text, scope)
+                self.boundaries(file, node.lineno, node.test, test, scope, probe)
+                self.probe(file, node.lineno, probe)
+            elif isinstance(node, (ast.Return, ast.Assert)) and isinstance(getattr(node, "value", None) or
+                                                                         getattr(node, "test", None), ast.Compare):
+                expr = node.value if isinstance(node, ast.Return) else node.test
+                probe = Probe(mangle(ast.parse(ast.unparse(expr), mode="eval").body, cls_name))
+                self.boundaries(file, node.lineno, expr, probe.node, scope, probe)
+                if probe.boundaries:
+                    self.probe(file, node.lineno, probe)
+
+
+def walk_own(fnode):
+    """Nodes of a function, including nested functions (they run as part of it)."""
+    stack = list(fnode.body)
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def build_goals(target):
+    builder = GoalBuilder()
+    trees = {}
+    for func in target.scope_functions():
+        code = func.__code__
+        file = code.co_filename
+        if file not in trees:
+            try:
+                trees[file] = ast.parse(Path(file).read_text())
+            except (OSError, SyntaxError):
+                continue
+        for fnode, cls_name in functions_with_class(trees[file]):
+            first = min([fnode.lineno] + [d.lineno for d in fnode.decorator_list])
+            if first == code.co_firstlineno or fnode.lineno == code.co_firstlineno:
+                builder.function(file, fnode, func.__qualname__, cls_name)
+                break
+    return builder
+
+
+def functions_with_class(tree):
+    def visit(node, cls):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                yield from visit(child, child.name)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                yield child, cls
+                yield from visit(child, cls)
+            else:
+                yield from visit(child, cls)
+    yield from visit(tree, None)
+
+
+# ----------------------------------------------------------------------------------------- tracer
+class Trace:
+    """Records lines, arcs, loop activations and condition distances for one run."""
+
+    def __init__(self, builder):
+        self.files = {g.file for g in builder.goals} | {f for f, _ in builder.probes}
+        self.applicable = set()     # boundary goals whose comparison has seen two integers (all runs)
+        self.probes = builder.probes
+        self.for_lines = {}
+        for file, line, body, g in builder.for_goals:
+            self.for_lines.setdefault(file, []).append((line, body, g))
+        self.reset()
+
+    def reset(self):
+        self.lines, self.arcs = set(), set()
+        self.hit = set()            # goal ids reached directly (if-expressions, boundaries, for0)
+        self.dist = {}              # goal id -> best distance
+        self.last, self.active = {}, {}
+
+    def global_trace(self, frame, event, arg):
+        if event == "call" and frame.f_code.co_filename in self.files:
+            self.last[frame] = None
+            self.active[frame] = set()
+            return self.local_trace
+        return None
+
+    def local_trace(self, frame, event, arg):
+        file = frame.f_code.co_filename
+        if event == "line":
+            line = frame.f_lineno
+            self.lines.add((file, line))
+            self.arcs.add((file, self.last.get(frame), line))
+            self.last[frame] = line
+            self.active.setdefault(frame, set()).add(line)
+            for probe in self.probes.get((file, line), ()):
+                self.run_probe(probe, frame)
+        elif event == "return":
+            self.arcs.add((file, self.last.pop(frame, None), -1))
+            seen = self.active.pop(frame, set())
+            for line, body, g in self.for_lines.get(file, ()):
+                if line in seen and body not in seen:
+                    self.hit.add(g.gid)
+        return self.local_trace
+
+    def run_probe(self, probe, frame):
+        if probe.true_goal is not None:
+            try:
+                t, f = distance(probe.node, frame)
+                self.note(probe.true_goal, t)
+                self.note(probe.false_goal, f)
+                if probe.covers_outcome:
+                    self.hit.add(probe.true_goal.gid if t == 0 else probe.false_goal.gid)
+            except Exception:  # Unsafe, or the expression fails on its own
+                pass
+        for left, right, goals in probe.boundaries:
+            try:
+                a, b = safe_eval(left, frame), safe_eval(right, frame)
+            except Exception:
+                continue
+            if not (isinstance(a, int) and isinstance(b, int)) or isinstance(a, bool) or isinstance(b, bool):
+                continue   # boundaries are about whole numbers; float times never sit exactly on one
+            for d, goal in goals.items():
+                self.applicable.add(goal.gid)
+                gap = abs((a - b) - d)
+                self.note(goal, norm(gap))
+                if gap == 0:
+                    self.hit.add(goal.gid)
+
+    def note(self, goal, d):
+        if d < self.dist.get(goal.gid, 2.0):
+            self.dist[goal.gid] = d
+
+    def covered(self, goal) -> bool:
+        if goal.gid in self.hit:
+            return True
+        check = goal.check
+        if not check:
+            return False
+        if check[0] == "line":
+            return (goal.file, check[1]) in self.lines
+        if check[0] == "exit":
+            lines, body = check[1], check[2]
+            return any(f == goal.file and p in lines and c not in lines and c != body for f, p, c in self.arcs)
+        return False
+
+
+# ----------------------------------------------------------------------------------------- search
+class Search:
+    def __init__(self, target, packages, builder, seed, budget):
+        self.target, self.builder, self.budget = target, builder, budget
+        self.rng = random.Random(seed)
+        self.gen = lib.Generator(target, packages, self.rng)
+        self.trace = Trace(builder)
+        self.goals = builder.goals
+        self.corpus = []
+        self.runs = 0
+
+    def evaluate(self, ind):
+        self.trace.reset()
+        lib.execute(self.target, ind, tracer=self.trace.global_trace)
+        self.runs += 1
+        new = False
+        for goal in self.goals:
+            if goal.witness is None and self.trace.covered(goal):
+                goal.witness, goal.best, new = ind, 0.0, True
+            d = self.trace.dist.get(goal.gid)
+            if goal.witness is None and d is not None and d < goal.best:
+                goal.best, goal.best_ind = d, ind
+        if new:
+            self.corpus.append(ind)
+        return new
+
+    def run(self):
+        deadline = time.time() + self.budget
+        for _ in range(30):
+            self.evaluate(self.gen.random())
+        turn = 0
+        while time.time() < deadline:
+            open_goals = [g for g in self.goals if g.witness is None]
+            if not open_goals:
+                break
+            goal = open_goals[turn % len(open_goals)]
+            turn += 1
+            for _ in range(8):  # a few tries per goal before moving on
+                if goal.best_ind is not None and self.rng.random() < 0.7:
+                    parent = goal.best_ind
+                elif self.corpus and self.rng.random() < 0.8:
+                    parent = self.rng.choice(self.corpus)
+                else:
+                    parent = self.gen.random()
+                other = self.rng.choice(self.corpus) if self.corpus else None
+                self.evaluate(self.gen.mutate(parent, other))
+                if goal.witness is not None or time.time() > deadline:
+                    break
+        self.minimize(deadline + min(5.0, self.budget / 4))
+
+    def reaches(self, ind, goal):
+        self.trace.reset()
+        lib.execute(self.target, ind, tracer=self.trace.global_trace)
+        return self.trace.covered(goal)
+
+    def minimize(self, deadline):
+        """Drop steps from each witness while it still reaches its goal."""
+        done = {}
+        for goal in self.goals:
+            if goal.witness is None or time.time() > deadline:
+                continue
+            key = (goal.witness.key(), goal.gid)
+            ind = goal.witness.copy()
+            i = len(ind.steps) - 1
+            while i >= 0 and time.time() < deadline:
+                if len(ind.steps) > 1 or self.target.cls is not None:
+                    trial = ind.copy()
+                    del trial.steps[i]
+                    if (trial.steps or self.target.cls is not None) and self.reaches(trial, goal):
+                        ind = trial
+                i -= 1
+            done[key] = ind
+            goal.witness = ind
+
+
+# ----------------------------------------------------------------------------------------- report
+def pick_cases(goals, limit):
+    """Distinct witnesses, chosen greedily so the printed cases reach as many goals as possible."""
+    by_code = {}
+    for g in goals:
+        if g.witness is not None:
+            by_code.setdefault(g.witness.key(), (g.witness, []))[1].append(g)
+    cases, left = [], set(g.gid for g in goals if g.witness is not None)
+    pool = list(by_code.values())
+    while pool and left and len(cases) < limit:
+        def score(item):
+            gs = [g for g in item[1] if g.gid in left]
+            return (sum(2 if g.kind == "branch" else 1 for g in gs), -len(item[0].steps))
+        pool.sort(key=score, reverse=True)
+        ind, gs = pool.pop(0)
+        if not any(g.gid in left for g in gs):
+            break
+        cases.append((ind, gs))
+        left -= {g.gid for g in gs}
+    return cases, left
+
+
+def list_targets(modules, packages):
+    rows = []
+    for t in lib.candidates(modules, packages):
+        if t.kind == "method":
+            continue
+        try:
+            builder = build_goals(t)
+        except Exception:
+            continue
+        branches = sum(1 for g in builder.goals if g.kind == "branch")
+        bounds = sum(1 for g in builder.goals if g.kind == "boundary") // 3
+        rows.append((branches, t.fullname, t.kind, bounds))
+    for branches, name, kind, bounds in sorted(rows, key=lambda r: (-r[0], r[1])):
+        print(f"{name}  [{kind}]  {branches} branch goals, {bounds} comparisons")
+    print("Run sbst NAME for one of these, or sbst Class.method for one method.")
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if "--help" in argv or "-h" in argv:
+        print(__doc__.strip())
+        return 0
+    parser = argparse.ArgumentParser(prog="sbst", add_help=False)
+    parser.add_argument("target", nargs="?")
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--budget", type=float, default=20.0)
+    parser.add_argument("--cases", type=int, default=8)
+    parser.add_argument("--line", type=int)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--package", action="append")
+    args = parser.parse_args(argv)
+
+    lib.limit_resources(wall_seconds=args.budget * 1.5 + 60)
+    root = Path.cwd().resolve()
+    sys.path.insert(0, str(root))
+    packages = lib.find_packages(root, args.package)
+    modules = lib.import_modules(lib.package_files(root, packages))
+    if not modules:
+        print("sbst: found no package to test (use --package)")
+        return 2
+    if args.list or not args.target:
+        list_targets(modules, packages)
+        return 0
+    found = lib.resolve(args.target, modules, packages)
+    if not found:
+        print(f"sbst: no function or class called {args.target!r}. Try sbst --list.")
+        return 2
+    if len(found) > 1:
+        print(f"sbst: {args.target!r} is ambiguous: " + ", ".join(t.fullname for t in found[:8]))
+        return 2
+    target = found[0]
+    builder = build_goals(target)
+    if not builder.goals:
+        print(f"sbst: {target.fullname} has no branches or comparisons to aim for. Test it from its spec.")
+        return 0
+    started = time.time()
+    search = Search(target, packages, builder, args.seed, args.budget)
+    search.run()
+    goals = [g for g in builder.goals if args.line is None or g.line == args.line]
+    if args.line is not None and not goals:
+        print(f"sbst: no goals on line {args.line}. Lines with goals: "
+              + ", ".join(str(l) for l in sorted({g.line for g in builder.goals})))
+        return 2
+
+    # Boundary goals whose comparison never saw two integers do not apply (e.g. float times).
+    goals = [g for g in goals if g.kind == "branch" or g.gid in search.trace.applicable]
+    branch = [g for g in goals if g.kind == "branch"]
+    bound = [g for g in goals if g.kind == "boundary"]
+    print(f"sbst {target.fullname}: reached {sum(g.witness is not None for g in branch)}/{len(branch)} branch goals"
+          f" and {sum(g.witness is not None for g in bound)}/{len(bound)} boundary goals"
+          f" ({time.time() - started:.1f} s, {search.runs} runs)")
+    print("'current:' is what the CURRENT code does, which may be buggy. It is not the expected value.\n")
+
+    cases, _ = pick_cases(goals, args.cases if args.line is None else 50)
+    for n, (ind, gs) in enumerate(cases, 1):
+        outcome = lib.execute(target, ind)
+        print(f"Case {n} reaches: " + "; ".join(g.title() for g in gs[:4]) + (" ..." if len(gs) > 4 else ""))
+        print(lib.render(target, ind, outcome))
+        print()
+    shown = {g.gid for _, gs in cases for g in gs}
+    more = [g for g in goals if g.witness is not None and g.gid not in shown]
+    if more:
+        print(f"Also reached ({len(more)}), see sbst {args.target} --line N: "
+              + ", ".join(sorted({f"L{g.line}" for g in more}, key=lambda s: int(s[1:]))))
+    missed = [g for g in goals if g.witness is None and g.kind == "branch"]
+    if missed:
+        print("Not reached (worth a hand-written test from the spec): "
+              + "; ".join(g.title() for g in missed[:6]) + (" ..." if len(missed) > 6 else ""))
+
+    names = [target.fullname]
+    if target.kind == "method":
+        names.append(target.fullname.rsplit(".", 1)[0])
+    print("\nSpec from extract_spec (step 1) for this target:")
+    print(lib.format_claims(lib.spec_claims(names, packages), names))
+    print("\nFor each case: find the claim that fixes its expected result and assert THAT value. If the claim "
+          "disagrees with 'current:', keep the claim's value (likely bug). If no claim decides it, skip the case.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

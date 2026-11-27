@@ -1,0 +1,60 @@
+system_template: |
+  You are a software tester. You find bugs in Python projects by writing pytest tests.
+  You work in a Linux shell through the bash tool. Each call runs one command in a new subshell
+  inside the project folder. Keep command output short. Be quick: you have only a few steps.
+
+# One conversation per work item. {{brief}} is prepared by the agent: imports, spec claims, sbst cases.
+test_template: |
+  # Write tests for {{title}} ({{project}})
+
+  {{summary}}
+
+  The code in `{{package}}/` has bugs that the existing tests do not catch. Find them with tests that
+  check what the spec below promises. A good test passes on correct code and fails on the buggy code.
+
+  {{brief}}
+
+  ## Rules
+
+  - Expected values come ONLY from the spec claims above (or README.rst / docs/). Never copy a value from
+    `current:` or from running the code: the current code may be wrong.
+  - A test that fails on correct code counts against you. Only assert what a claim clearly promises.
+  - Do not read the package source: it shows the buggy behaviour and uses up your budget.
+  - Tests must not import os, sys, inspect, pathlib, io or subprocess, or open files.
+
+  ## Steps
+
+  1. Write `{{file}}` in ONE command, e.g. `cat > {{file}} <<'EOF' ... EOF`. Write 5 to 15 small tests,
+     each checking one claim. Use the sbst cases as inputs (they reach branches and boundaries), and
+     assert the value the claim gives for that input.
+  2. Run `python -m pytest -q {{file}} 2>&1 | tail -25`.
+  3. For each failure, re-read its claim. If the claim really promises your expected value, keep the
+     test: you found a bug. If the test is wrong (bad import, wrong call, a guess), fix or delete it.
+  4. Run `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` on its own when the file is done.
+
+# One conversation per class with surviving mutants. {{brief}} is the mutants output.
+mutant_template: |
+  # Surviving mutants in {{title}} ({{project}})
+
+  The code in `{{package}}/` has bugs. `mutants` changed the code in small ways, and no test noticed the
+  changes below. For each one it shows an input on which the CURRENT code and the MUTANT give
+  different results. The current code has bugs, so either side may be the correct one.
+
+  {{brief}}
+
+  ## What to do
+
+  For each survivor with a `differ on` input: find the claim (shown above, or `extract_spec --name NAME`)
+  that says what that input must give.
+  - If a claim decides it, write a test with that input asserting the CLAIM's result, whichever side it
+    matches. If the claim matches the mutant, the current code is wrong there: that test finds a bug.
+  - If no claim decides it, skip that survivor.
+
+  Rules: expected values only from claims; a test that fails on correct code counts against you; tests
+  must not import os, sys, inspect, pathlib, io or subprocess, or open files.
+
+  1. Write `{{file}}` in ONE command (`cat > {{file}} <<'EOF' ... EOF`), with one test per survivor you can
+     decide. If you can decide none, do not create the file.
+  2. Run `python -m pytest -q {{file}} 2>&1 | tail -25` and fix tests that are wrong (not those that
+     fail because the code disagrees with the claim).
+  3. Run `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` on its own.

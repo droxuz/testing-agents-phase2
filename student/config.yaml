@@ -1,0 +1,26 @@
+# Settings for student/agent.py. A copy with use_sbst/use_mutants set to false is the ablation baseline.
+
+use_sbst: true            # put sbst cases (branch and boundary inputs) into each brief
+use_mutants: true         # after the spec phase, test surviving mutants that have a witness input
+confirm_failures: true    # disable failing tests that no small code change can make pass (mutants --check-failing)
+confirm_budget: 300       # seconds for that check
+
+# Conversations
+steps_per_episode: 7      # model calls in one conversation
+keep_outputs: 2           # command outputs kept in full in the history; older ones are replaced by a note
+max_output_chars: 3500    # longest command output shown to the model
+min_episode_tokens: 12000 # do not start a conversation with less than this left
+max_episode_tokens: 45000 # token cap of one conversation
+
+# Planning and briefs
+methods_per_item: 5       # methods of a class per work item
+spec_chars: 4500          # claims shown in one brief
+sbst_cases: 5
+sbst_budget: 6            # seconds of search per brief
+sbst_chars: 3500
+
+# Mutants phase
+mutants_share: 0.2        # part of the token budget kept for it
+mutants_show: 4
+mutants_budget: 60        # seconds per mutants run
+mutants_chars: 6000

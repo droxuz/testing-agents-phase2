@@ -1,0 +1,1623 @@
+#!/usr/bin/env python3
+"""extract_spec: collect what the README, docs/ and docstrings promise about each class and function.
+
+Usage: extract_spec [--list] [--name REGEX] [--claims KINDS] [--compact] [-o FILE] [--package PKG]
+
+Prints JSON with one entry per public class, function, method and property of the package:
+  name, kind, signature, docstring, defined_in, documented_signatures, bases, inherited, members,
+  claims: [{text, kind, source: {file, line, origin}}]   origin is docstring, readme or docs
+Claim kinds: behavior, param, returns, raises, default, example, usage, note, deprecated, complexity.
+Doctest lines (>>> code, expected output) become "example" claims with code, expected and setup.
+Statements no single class or function owns go to "general_claims".
+
+Options:
+  --list          one line per entity (name, kind, signature, number of claims) instead of JSON
+  --name REGEX    only entities whose name matches, e.g. --name LRUCache or --name 'SortedList.add$'
+  --claims KINDS  only claims of these kinds, e.g. --claims example,raises,returns
+  --compact       leave out docstrings and duplicate sources (smaller output; claims stay complete)
+  -o FILE         write the JSON to FILE instead of printing it
+  --package PKG   package folder or module file to scan (repeatable; default: auto-detect)
+  --private       also include private (_name) classes and functions
+  --no-import     do not import the package (static analysis only)
+Start with --list, then ask for the entities you are testing with --name.
+"""
+
+import argparse
+import ast
+import contextlib
+import copy
+import inspect
+import io
+import json
+import re
+import signal
+import sys
+import textwrap
+from pathlib import Path
+
+MAX_TEXT = 400          # longest claim text kept
+MAX_SETUP = 20          # most setup statements kept for one example
+MAX_MENTIONS = 3        # a docs sentence naming more entities than this is a general claim
+MAX_CODE_LINES = 40     # longest code example kept
+MAX_DOC_BYTES = 2_000_000
+IMPORT_TIMEOUT = 20
+
+CLASS_KINDS = {"class", "exception"}
+TOP_KINDS = {"class", "exception", "function", "module"}
+SKIP_DIRS = {"tests", "tests_new", "test", "testing", "docs", "doc", "build", "dist", "examples", "example",
+             "benchmarks", "benchmark", "scripts", "tools", "site-packages", "node_modules", "venv", "env"}
+DOC_DIRS = ("docs", "doc")
+DOC_SUFFIXES = {".rst", ".md", ".txt", ".markdown"}
+DOC_SKIP_FILE = re.compile(r"change|history|release|news|author|licen[cs]e|contribut|conduct|security|"
+                           r"todo|roadmap|sponsor|funding|requirements", re.I)
+SKIP_HEADING = re.compile(  # sections whose unowned sentences are not about behaviour
+    r"\b(install|installation|installing|licen[cs]e|copyright|credits?|authors?|acknowledg\w*|contribut\w*|"
+    r"testimonials?|change ?log|history|release notes|links?|resources|related projects?|"
+    r"support|donat\w*|sponsors?|badges?|table of contents|contents|indices and tables|benchmarks?|"
+    r"performance|development|build status|requirements|features|talks?|videos?|user guide|"
+    r"community guide|documentation|citation|citing|faq)\b",
+    re.I)
+
+DIRECTIVE_RE = re.compile(r"^(\s*)\.\.\s+([A-Za-z][\w:-]*)::(?:\s+(.*))?$")
+OPTION_RE = re.compile(r"^:([\w-]+):(?:\s+(.*))?$")
+TARGET_RE = re.compile(r"^\.\.\s+_`?([^:`]+)`?:")
+FIELD_RE = re.compile(r"^:([A-Za-z][\w-]*)(?:\s+([^:]+?))?:(?:\s+(.*))?$")
+BULLET_RE = re.compile(r"^([*+\-•]|\d+[.)]|#\.)\s+(.*)$")
+RULE_CHARS = set("=-~^\"'`#*+.:_!$%&,;<>?@\\/|")
+GOOGLE_RE = re.compile(r"^(args|arguments|parameters|params|keyword args|keyword arguments|other parameters|"
+                       r"returns|return|yields|yield|raises|raise|exceptions|attributes|warns|example|examples|"
+                       r"note|notes|todo|see also|warning|warnings|references)\s*:\s*$", re.I)
+SECTION_FIELD = {"args": "param", "arguments": "param", "parameters": "param", "params": "param",
+                 "keyword args": "param", "keyword arguments": "param", "other parameters": "param",
+                 "attributes": "attribute", "returns": "returns", "return": "returns", "yields": "returns",
+                 "yield": "returns", "raises": "raises", "raise": "raises", "exceptions": "raises",
+                 "warns": "raises"}
+ENTITY_DIRECTIVES = {"autoclass", "autofunction", "automethod", "autoattribute", "autoproperty",
+                     "autoexception", "autodecorator", "autodata", "class", "function", "method",
+                     "attribute", "property", "decorator", "decoratormethod", "exception", "data",
+                     "classmethod", "staticmethod"}
+MODULE_DIRECTIVES = {"module", "currentmodule", "automodule"}
+CODE_DIRECTIVES = {"code-block", "code", "sourcecode", "doctest", "testcode", "testoutput", "ipython",
+                   "jupyter-execute", "parsed-literal"}
+ADMONITIONS = {"note", "warning", "important", "tip", "caution", "attention", "danger", "error", "hint",
+               "seealso", "deprecated", "versionadded", "versionchanged", "versionremoved", "admonition",
+               "topic", "todo", "rubric", "container", "sidebar"}
+VERSION_LABELS = {"deprecated": "Deprecated since version", "versionadded": "New in version",
+                  "versionchanged": "Changed in version", "versionremoved": "Removed in version"}
+REF_ROLES = {"class", "meth", "func", "attr", "exc", "obj", "data", "const", "mod", "method", "function",
+             "attribute", "exception", "property", "decorator"}
+SHELL_LANGS = {"bash", "sh", "shell", "console", "shell-session", "zsh", "bat", "powershell", "ps1", "text",
+               "none", "ini", "toml", "yaml", "json", "cfg", "make", "dockerfile"}
+ABBREV_RE = re.compile(r"\b(e\.g|i\.e|etc|vs|cf|approx|incl|resp|viz|al|mr|dr|no|fig|eq|ca|esp)\.", re.I)
+IDENT_RE = re.compile(r"^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)*$")
+CAMEL_RE = re.compile(r"\b[A-Z][A-Za-z0-9_]*[A-Z][A-Za-z0-9_]*\b|\b[A-Z][a-z0-9]+[A-Z][A-Za-z0-9_]*\b")
+ASSIGN_CALL_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*([A-Za-z_][\w.]*)\s*\(")
+CODE_IDENT_RE = re.compile(r"(?<![\w.])[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
+BEHAVIOR_RE = re.compile(
+    r"\b(returns?|returned|raises?|raised|must|should|shall|will|default|always|never|only|if|when|unless|"
+    r"equal|greater|less|maximum|minimum|at least|at most|sorted|order|empty|none|true|false|error|"
+    r"discard|evict|remove|insert|key|keys|value|values|item|items|size|length|index|argument|parameter)\b",
+    re.I)
+
+
+# ----------------------------------------------------------------------------------------------------
+# small text helpers
+# ----------------------------------------------------------------------------------------------------
+
+def indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def is_rule(text: str) -> bool:
+    return len(text) >= 3 and len(set(text)) == 1 and text[0] in RULE_CHARS
+
+
+def is_private_name(name: str) -> bool:
+    """True if any dotted component starts with '_' and is not a dunder."""
+    for part in name.split("."):
+        if part.startswith("_") and not (part.startswith("__") and part.endswith("__") and len(part) > 4):
+            return True
+    return False
+
+
+def truncate(text: str, limit: int = MAX_TEXT) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def one_line(code: str, limit: int = 120) -> str:
+    text = " ".join(part.strip() for part in code.strip().splitlines())
+    return truncate(text, limit)
+
+
+def trim_code(code: str) -> str:
+    lines = code.strip("\n").splitlines()
+    if len(lines) > MAX_CODE_LINES:
+        lines = lines[:MAX_CODE_LINES] + ["# ... (truncated)"]
+    return "\n".join(lines)
+
+
+def split_sentences(text: str) -> list[str]:
+    protected = ABBREV_RE.sub(lambda m: m.group(0).replace(".", "\x01"), text)
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[\x00*_`])", protected)
+    return [p.replace("\x01", ".").strip() for p in parts if p.strip()]
+
+
+def classify(text: str, tag: str | None) -> str:
+    if tag in VERSION_LABELS:
+        return "deprecated" if tag in ("deprecated", "versionremoved") else "note"
+    if re.search(r"\bcomplexity\b|\bO\([^)]*\)", text, re.I):
+        return "complexity"
+    if re.search(r"\b(raises?|raised|throws?|thrown)\b|\b[A-Z]\w*(Error|Exception)\b", text):
+        return "raises"
+    if re.search(r"\b(returns?|returned)\b", text, re.I):
+        return "returns"
+    if re.search(r"\bdefaults?\b|\bby default\b", text, re.I):
+        return "default"
+    if tag in ("note", "warning", "important", "caution", "attention", "danger", "tip", "hint"):
+        return "note"
+    return "behavior"
+
+
+def is_noise(text: str, min_words: int = 2) -> bool:
+    words = re.findall(r"[A-Za-z]{2,}", text)
+    if re.fullmatch(r"\W*`[^`]*`\W*", text):  # only a cross-reference, e.g. a "Methods for ..." list item
+        return True
+    return len(words) < min_words or text.rstrip().endswith(":")
+
+
+class Inline:
+    """Inline markup cleaned to plain text; code spans are held as placeholders until restored."""
+
+    def __init__(self, text: str, markdown: bool = False, targets: frozenset = frozenset()):
+        self.spans: list[dict] = []
+        self.text = self._clean_md(text) if markdown else self._clean_rst(text, targets)
+
+    def _hold(self, display: str, ref: str | None = None, role: str | None = None) -> str:
+        self.spans.append({"display": display, "ref": ref, "role": role})
+        return f"\x00{len(self.spans) - 1}\x00"
+
+    def _role(self, match: re.Match) -> str:
+        role, content = match.group(1).lower(), match.group(2)
+        title, target = content, content
+        parts = re.match(r"^(.*?)\s*<([^<>]+)>$", content, re.S)
+        if parts and parts.group(1):
+            title, target = parts.group(1), parts.group(2)
+        target = target.lstrip("~!").strip()
+        if role in REF_ROLES:
+            shown = title.lstrip("~!") if title != content else target
+            return self._hold(f"`{shown}`", ref=target, role=role)
+        if role in ("math", "code", "samp", "file", "kbd", "command", "program"):
+            return self._hold(f"`{content}`")
+        return title
+
+    def _clean_rst(self, text: str, targets: frozenset) -> str:
+        t = re.sub(r"``(.+?)``", lambda m: self._hold(f"`{m.group(1)}`", m.group(1), "literal"), text)
+        t = re.sub(r"(?<![\w`]):(?:[\w-]+:)*([\w-]+):`([^`]+)`", self._role, t)
+        t = re.sub(r"`([^`<]*?)\s*<[^`>]*>`__?", lambda m: m.group(1), t)
+        t = re.sub(r"`([^`]+)`__?", lambda m: m.group(1), t)
+        t = re.sub(r"(?<![\w`])`([^`]+)`(?![\w`])", lambda m: self._hold(f"`{m.group(1)}`", m.group(1), "default"), t)
+        if targets:
+            t = re.sub(r"\b([A-Za-z][\w.-]*?)__?(?=[\s.,;:!?)\]]|$)",
+                       lambda m: m.group(1) if m.group(1).lower() in targets else m.group(0), t)
+        t = re.sub(r"(?<![\w*])\*\*(?=\S)(.+?)(?<=\S)\*\*(?![\w*])", r"\1", t)
+        t = re.sub(r"(?<![\w*])\*(?=\S)(.+?)(?<=\S)\*(?![\w*])", r"\1", t)
+        t = re.sub(r"\\(.)", r"\1", t)
+        t = re.sub(r"\|([\w -]+)\|", r"\1", t)
+        return re.sub(r"\s+", " ", t).strip()
+
+    def _clean_md(self, text: str) -> str:
+        t = re.sub(r"(`+)(.+?)\1", lambda m: self._hold(f"`{m.group(2).strip()}`", m.group(2).strip(), "literal"), text)
+        t = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", t)
+        t = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", t)
+        t = re.sub(r"\[([^\]]+)\]\[[^\]]*\]", r"\1", t)
+        t = re.sub(r"<[^>]+>", "", t)
+        t = re.sub(r"(?<![\w*])(\*\*|__)(?=\S)(.+?)(?<=\S)\1(?![\w*])", r"\2", t)
+        t = re.sub(r"(?<![\w*])\*(?=\S)(.+?)(?<=\S)\*(?![\w*])", r"\1", t)
+        t = re.sub(r"(?<!\w)_(?=\S)(.+?)(?<=\S)_(?!\w)", r"\1", t)
+        return re.sub(r"\s+", " ", t).strip()
+
+    def restore(self, piece: str) -> tuple[str, list[dict]]:
+        used = []
+
+        def put(match):
+            span = self.spans[int(match.group(1))]
+            used.append(span)
+            return span["display"]
+
+        return re.sub(r"\x00(\d+)\x00", put, piece), used
+
+
+def parse_doctest(lines: list[str], first_line: int) -> list[dict]:
+    """Doctest lines -> steps [{code, expected, line}]. Blank lines end the expected output."""
+    steps: list[dict] = []
+    current = None
+    base = None
+    for offset, raw in enumerate(lines):
+        if not raw.strip():
+            current = None
+            continue
+        if base is None or indent_of(raw) < base:
+            base = indent_of(raw)
+        text = raw[base:] if indent_of(raw) >= base else raw.strip()
+        stripped = text.strip()
+        if stripped.startswith(">>>"):
+            code = stripped[4:] if stripped[3:4] == " " else stripped[3:]
+            current = {"code": code, "expected": [], "line": first_line + offset}
+            steps.append(current)
+        elif stripped.startswith("...") and current is not None and not current["expected"]:
+            current["code"] += "\n" + (stripped[4:] if stripped[3:4] == " " else stripped[3:])
+        elif current is not None:
+            current["expected"].append("" if stripped == "<BLANKLINE>" else text.rstrip())
+    for step in steps:
+        expected = step["expected"]
+        if expected:
+            margin = min((indent_of(e) for e in expected if e.strip()), default=0)
+            expected = [e[margin:] for e in expected]
+        step["expected"] = "\n".join(expected).strip("\n")
+        step["code"] = step["code"].rstrip()
+    return steps
+
+
+# ----------------------------------------------------------------------------------------------------
+# static analysis of the package
+# ----------------------------------------------------------------------------------------------------
+
+def docstring_of(node) -> tuple[str | None, int | None]:
+    body = getattr(node, "body", None)
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        raw = body[0].value.value
+        lines = raw.expandtabs().split("\n")
+        lead = 0
+        while lead < len(lines) and not lines[lead].strip():
+            lead += 1
+        return inspect.cleandoc(raw), body[0].value.lineno + lead
+    return None, None
+
+
+def format_signature(fn, drop_first: bool = False) -> str:
+    args = copy.deepcopy(fn.args)
+    if drop_first:
+        positional = len(args.posonlyargs) + len(args.args)
+        if args.posonlyargs:
+            args.posonlyargs = args.posonlyargs[1:]
+        elif args.args:
+            args.args = args.args[1:]
+        if positional and len(args.defaults) > positional - 1:
+            args.defaults = args.defaults[len(args.defaults) - (positional - 1):] if positional > 1 else []
+    text = f"({ast.unparse(args)})"
+    if fn.returns is not None:
+        text += f" -> {ast.unparse(fn.returns)}"
+    return text
+
+
+def literal_names(node) -> list[str] | None:
+    try:
+        value = ast.literal_eval(node)
+    except (ValueError, SyntaxError, TypeError):
+        return None
+    if isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value):
+        return list(value)
+    return None
+
+
+@contextlib.contextmanager
+def time_limit(seconds: int):
+    usable = hasattr(signal, "SIGALRM")
+    if usable:
+        def stop(signum, frame):
+            raise TimeoutError("import took too long")
+        try:
+            old = signal.signal(signal.SIGALRM, stop)
+            signal.alarm(seconds)
+        except ValueError:  # not in the main thread
+            usable = False
+    try:
+        yield
+    finally:
+        if usable:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
+
+class Spec:
+    def __init__(self, root: Path, include_private: bool):
+        self.root = root
+        self.include_private = include_private
+        self.defs: dict[str, dict] = {}
+        self.aliases: dict[str, str] = {}
+        self.stars: list[tuple[str, str]] = []
+        self.module_all: dict[str, list[str]] = {}
+        self.assigned: dict[str, dict[str, int]] = {}
+        self.modules: dict[str, str] = {}
+        self.roots: set[str] = set()
+        self.claims: dict[str, list[dict]] = {}
+        self.claim_keys: dict[tuple, dict] = {}
+        self.general: list[dict] = []
+        self.documented: dict[str, list[dict]] = {}
+        self.doc_signatures: dict[str, list[str]] = {}
+        self.code_files: list[str] = []
+        self.doc_files: list[str] = []
+        self.import_errors: dict[str, str] = {}
+        self.imported = False
+
+    # ---------------------------------------------------------------- discovery and static parse
+
+    def scan(self, packages: list[str]):
+        targets = []
+        if packages:
+            for name in packages:
+                path = (self.root / name).resolve()
+                if path != self.root and self.root not in path.parents:
+                    print(f"extract_spec: {name!r} is outside the current folder; skipped", file=sys.stderr)
+                    continue
+                if path.is_dir():
+                    targets.append(path)
+                elif path.with_suffix(".py").is_file():
+                    targets.append(path.with_suffix(".py"))
+                elif path.is_file() and path.suffix == ".py":
+                    targets.append(path)
+                else:
+                    print(f"extract_spec: no package or module named {name!r}", file=sys.stderr)
+        else:
+            for path in sorted(self.root.iterdir()):
+                if path.is_dir() and (path / "__init__.py").is_file() and path.name not in SKIP_DIRS \
+                        and not path.name.startswith((".", "_")):
+                    targets.append(path)
+            if not targets:
+                for path in sorted(self.root.glob("*.py")):
+                    if path.name not in ("setup.py", "conftest.py", "noxfile.py", "tasks.py") \
+                            and not path.name.startswith(("test_", ".")):
+                        targets.append(path)
+        for target in targets:
+            if target.is_dir():
+                self.roots.add(target.name)
+                files = sorted(target.rglob("*.py"), key=lambda p: (p.parent.as_posix(), p.name != "__init__.py", p.name))
+                for path in files:
+                    rel_parts = path.relative_to(target).parts
+                    if any(part in ("__pycache__", "tests", "test") or part.startswith(".") for part in rel_parts[:-1]):
+                        continue
+                    parts = [target.name, *rel_parts[:-1]]
+                    if path.name != "__init__.py":
+                        parts.append(path.stem)
+                    self.parse_module(path, ".".join(parts))
+            else:
+                self.roots.add(target.stem)
+                self.parse_module(target, target.stem)
+
+    def parse_module(self, path: Path, module: str):
+        rel = path.relative_to(self.root).as_posix()
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError as error:
+            print(f"extract_spec: cannot parse {rel}: {error}", file=sys.stderr)
+            return
+        self.modules[module] = rel
+        self.code_files.append(rel)
+        self.add(module, "", "module", rel, 1, None, tree)
+        self.walk(tree.body, module, "", rel, path.name == "__init__.py", None)
+
+    def add(self, module, qualname, kind, file, line, signature, node, parent=None, **extra) -> dict:
+        eid = f"{module}.{qualname}" if qualname else module
+        if eid in self.defs:
+            return self.defs[eid]
+        doc, doc_line = docstring_of(node) if node is not None else (None, None)
+        entity = {"id": eid, "module": module, "qualname": qualname, "kind": kind, "file": file, "line": line,
+                  "signature": signature, "docstring": doc, "doc_line": doc_line, "doc_fixed": False,
+                  "parent": parent, "members": []}
+        entity.update(extra)
+        self.defs[eid] = entity
+        if parent:
+            self.defs[parent]["members"].append(qualname.rsplit(".", 1)[-1])
+        return entity
+
+    def walk(self, body, module, prefix, file, is_pkg, class_id):
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.add_function(node, module, prefix, file, class_id)
+            elif isinstance(node, ast.ClassDef):
+                qual = prefix + node.name
+                bases = [ast.unparse(b) for b in node.bases]
+                kind = "exception" if re.search(r"(Error|Exception|Warning)$", node.name) or \
+                    any(re.search(r"(Error|Exception|Warning)$", b) for b in bases) else "class"
+                entity = self.add(module, qual, kind, file, node.lineno, None, node, parent=class_id,
+                                  bases=bases, decorators=[ast.unparse(d) for d in node.decorator_list])
+                self.walk(node.body, module, qual + ".", file, is_pkg, entity["id"])
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                self.add_assignment(node, module, prefix, file, class_id)
+            elif isinstance(node, ast.ImportFrom) and class_id is None:
+                self.add_import_from(node, module, is_pkg)
+            elif isinstance(node, ast.Import) and class_id is None:
+                for alias in node.names:
+                    if alias.asname and alias.name.split(".")[0] in self.roots | {module.split(".")[0]}:
+                        self.aliases[f"{module}.{alias.asname}"] = alias.name
+            elif isinstance(node, (ast.If, ast.Try, ast.With)) or type(node).__name__ == "TryStar":
+                for field in ("body", "orelse", "finalbody"):
+                    self.walk(getattr(node, field, []) or [], module, prefix, file, is_pkg, class_id)
+                for handler in getattr(node, "handlers", []) or []:
+                    self.walk(handler.body, module, prefix, file, is_pkg, class_id)
+
+    def add_function(self, node, module, prefix, file, class_id):
+        qual = prefix + node.name
+        decorators = [ast.unparse(d) for d in node.decorator_list]
+        names = [d.split("(")[0] for d in decorators]
+        if class_id is None:
+            kind = "function"
+        elif any(n.endswith((".setter", ".getter", ".deleter")) for n in names):
+            existing = self.defs.get(f"{module}.{qual}")
+            if existing is not None:
+                accessor = next(n for n in names if n.endswith((".setter", ".getter", ".deleter"))).rsplit(".", 1)[1]
+                existing.setdefault("accessors", []).append(accessor)
+                if not existing["docstring"]:
+                    existing["docstring"], existing["doc_line"] = docstring_of(node)
+            return
+        elif any(n.split(".")[-1] in ("property", "cached_property", "abstractproperty") for n in names):
+            kind = "property"
+        elif "classmethod" in names:
+            kind = "classmethod"
+        elif "staticmethod" in names:
+            kind = "staticmethod"
+        else:
+            kind = "method"
+        signature = None if kind == "property" else format_signature(node)
+        extra = {"decorators": decorators} if decorators else {}
+        if isinstance(node, ast.AsyncFunctionDef):
+            extra["async"] = True
+        if class_id and node.name in ("__init__", "__new__"):
+            extra["_ctor_sig"] = format_signature(node, drop_first=True)
+        self.add(module, qual, kind, file, node.lineno, signature, node, parent=class_id, **extra)
+
+    def add_assignment(self, node, module, prefix, file, class_id):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        names = [t.id for t in targets if isinstance(t, ast.Name)]
+        if node.value is None:
+            return
+        for name in names:
+            if class_id is None and name == "__all__":
+                values = literal_names(node.value)
+                if values is not None:
+                    self.module_all[module] = values
+                continue
+            if isinstance(node.value, ast.Name):  # `bisect = bisect_right`: another name for the same thing
+                target = f"{module}.{prefix}{node.value.id}"
+                if target in self.defs or target in self.aliases:
+                    self.aliases[f"{module}.{prefix}{name}"] = target
+                    continue
+            self.assigned.setdefault(class_id or module, {})[name] = node.lineno
+
+    def add_import_from(self, node, module, is_pkg):
+        if node.level:
+            parts = module.split(".")
+            base = parts if is_pkg else parts[:-1]
+            if node.level > 1:
+                base = base[: max(0, len(base) - (node.level - 1))]
+            source = ".".join(base + ([node.module] if node.module else []))
+        else:
+            source = node.module or ""
+            if source.split(".")[0] not in self.roots | {module.split(".")[0]}:
+                return
+        for alias in node.names:
+            if alias.name == "*":
+                self.stars.append((module, source))
+            else:
+                key = f"{module}.{alias.asname or alias.name}"
+                if key != f"{source}.{alias.name}":
+                    self.aliases[key] = f"{source}.{alias.name}"
+
+    # ---------------------------------------------------------------- runtime enrichment
+
+    def enrich_at_runtime(self):
+        sys.path.insert(0, str(self.root))
+        sink = io.StringIO()
+        for module in list(self.modules):
+            try:
+                with time_limit(IMPORT_TIMEOUT), contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                    import importlib
+                    mod = importlib.import_module(module)
+            except BaseException as error:  # noqa: BLE001 - a broken module must not stop the tool
+                self.import_errors[module] = f"{type(error).__name__}: {error}"
+                continue
+            self.imported = True
+            for attr, value in list(vars(mod).items()):
+                if inspect.ismodule(value):
+                    if value.__name__ in self.modules and f"{module}.{attr}" != value.__name__:
+                        self.aliases.setdefault(f"{module}.{attr}", value.__name__)
+                    continue
+                if not (inspect.isclass(value) or inspect.isfunction(value)):
+                    continue
+                home, qual = getattr(value, "__module__", None), getattr(value, "__qualname__", "")
+                if home in self.modules and "<locals>" not in qual:
+                    key, target = f"{module}.{attr}", f"{home}.{qual}"
+                    if key != target:
+                        self.aliases.setdefault(key, target)
+            for entity in [e for e in self.defs.values() if e["module"] == module and e["kind"] in CLASS_KINDS]:
+                obj = mod
+                for part in entity["qualname"].split("."):
+                    obj = getattr(obj, part, None)
+                if not inspect.isclass(obj) or obj.__qualname__ != entity["qualname"]:
+                    continue
+                self.enrich_class(entity, obj)
+            for entity in [e for e in self.defs.values() if e["module"] == module and e["kind"] == "function"]:
+                func = getattr(mod, entity["qualname"], None)
+                if func is not None and not entity["docstring"] and isinstance(getattr(func, "__doc__", None), str):
+                    entity["docstring"], entity["doc_line"], entity["doc_fixed"] = inspect.cleandoc(func.__doc__), entity["line"], True
+
+    def enrich_class(self, entity, cls):
+        try:
+            entity["_runtime_sig"] = re.sub(r" at 0x[0-9a-fA-F]+", "", str(inspect.signature(cls)))
+        except (TypeError, ValueError):
+            pass
+        for name, value in list(vars(cls).items()):
+            func, kind = value, "method"
+            if isinstance(value, staticmethod):
+                func, kind = value.__func__, "staticmethod"
+            elif isinstance(value, classmethod):
+                func, kind = value.__func__, "classmethod"
+            elif isinstance(value, property):
+                func, kind = value.fget, "property"
+            elif not inspect.isfunction(value):
+                continue
+            doc = getattr(value if kind == "property" else func, "__doc__", None)
+            member_id = f"{entity['id']}.{name}"
+            if member_id in self.defs:
+                member = self.defs[member_id]
+                if not member["docstring"] and isinstance(doc, str) and doc.strip():
+                    member["docstring"], member["doc_line"], member["doc_fixed"] = inspect.cleandoc(doc), member["line"], True
+                    member["doc_origin"] = "docstring (set at runtime)"
+                continue
+            if not (isinstance(doc, str) and doc.strip()):
+                continue  # generated without documentation (dataclass, attrs, ...): nothing to report
+            line = self.assigned.get(entity["id"], {}).get(name)
+            if line is None:
+                try:
+                    line = inspect.getsourcelines(func)[1]
+                except (OSError, TypeError):
+                    line = entity["line"]
+            signature = None
+            if kind != "property":
+                try:
+                    signature = re.sub(r" at 0x[0-9a-fA-F]+", "", str(inspect.signature(func)))
+                except (TypeError, ValueError):
+                    pass
+            real_name = getattr(func, "__name__", name)
+            if real_name != name and f"{entity['id']}.{real_name}" in self.defs:
+                self.aliases[member_id] = f"{entity['id']}.{real_name}"
+                continue
+            text = inspect.cleandoc(doc) if isinstance(doc, str) and doc.strip() else None
+            self.add(entity["module"], f"{entity['qualname']}.{name}", kind, entity["file"], line, signature, None,
+                     parent=entity["id"], docstring=text, doc_line=line, doc_fixed=True,
+                     doc_origin="docstring (set at runtime)")
+
+    # ---------------------------------------------------------------- names and resolution
+
+    def finish_names(self):
+        for _ in range(5):  # star imports, possibly chained
+            changed = False
+            for module, source in self.stars:
+                names = self.module_all.get(source)
+                if names is None:
+                    names = [e["qualname"] for e in self.defs.values()
+                             if e["module"] == source and e["qualname"] and "." not in e["qualname"]
+                             and not e["qualname"].startswith("_")]
+                    names += [k[len(source) + 1:] for k in self.aliases
+                              if k.startswith(source + ".") and "." not in k[len(source) + 1:]
+                              and not k[len(source) + 1:].startswith("_")]
+                for name in names:
+                    key = f"{module}.{name}"
+                    if key not in self.aliases and key not in self.defs:
+                        self.aliases[key] = f"{source}.{name}"
+                        changed = True
+            if not changed:
+                break
+        for entity in self.defs.values():
+            if entity["kind"] in CLASS_KINDS:
+                entity["base_ids"] = [b for b in (self.resolve_in_module(entity["module"], re.sub(r"\[.*$", "", base))
+                                                  for base in entity.get("bases", [])) if b and b != entity["id"]
+                                      and self.defs[b]["kind"] in CLASS_KINDS]
+        for entity in self.defs.values():
+            if entity["kind"] in CLASS_KINDS and not entity["signature"]:
+                entity["signature"] = self.class_signature(entity["id"], set()) or entity.get("_runtime_sig")
+        reverse: dict[str, set] = {}
+        for alias in self.aliases:
+            target = self.resolve_name(alias)
+            if target and target != alias:
+                reverse.setdefault(target, set()).add(alias)
+        for entity in self.defs.values():  # parents are always defined before their members
+            names = {entity["id"]} | reverse.get(entity["id"], set())
+            if entity["parent"]:
+                parent_names = self.defs[entity["parent"]]["names"]
+                members = {entity["qualname"].rsplit(".", 1)[-1]}
+                members |= {n.rsplit(".", 1)[1] for n in names if n.rsplit(".", 1)[0] in parent_names}
+                names |= {f"{p}.{m}" for p in parent_names for m in members}
+            entity["names"] = names
+        for entity in self.defs.values():
+            if entity["kind"] not in CLASS_KINDS:
+                continue
+            public = [n for n in entity["names"] if not is_private_name(n)]
+            if not public:
+                continue
+            own, todo, seen = set(entity["members"]), list(entity.get("base_ids", [])), set()
+            while todo:
+                base = todo.pop(0)
+                if base in seen:
+                    continue
+                seen.add(base)
+                for member in self.defs[base]["members"]:
+                    if member in own:
+                        continue
+                    own.add(member)
+                    member_entity = self.defs[f"{base}.{member}"]
+                    if all(is_private_name(n) for n in member_entity["names"]):
+                        member_entity["names"] |= {f"{n}.{member}" for n in public}
+                todo.extend(self.defs[base].get("base_ids", []))
+        for entity in self.defs.values():
+            own = (entity["qualname"] or entity["module"]).rsplit(".", 1)[-1]
+            entity["name"] = min(entity["names"], key=lambda n: (is_private_name(n), n.count("."),
+                                                                 n.rsplit(".", 1)[-1] != own, n != entity["id"],
+                                                                 len(n), n))
+        self.index: dict[str, set] = {}
+        self.suffix: dict[str, set] = {}
+        for entity in self.defs.values():
+            for name in entity["names"]:
+                self.index.setdefault(name, set()).add(entity["id"])
+                parts = name.split(".")
+                for k in range(1, len(parts)):
+                    self.suffix.setdefault(".".join(parts[k:]), set()).add(entity["id"])
+
+    def class_signature(self, class_id, seen) -> str | None:
+        if class_id in seen:
+            return None
+        seen.add(class_id)
+        for ctor in ("__init__", "__new__"):
+            member = self.defs.get(f"{class_id}.{ctor}")
+            if member and member.get("_ctor_sig"):
+                return member["_ctor_sig"]
+        for base in self.defs[class_id].get("base_ids", []):
+            found = self.class_signature(base, seen)
+            if found:
+                return found
+        return None
+
+    def resolve_in_module(self, module, dotted):
+        return self.resolve_name(f"{module}.{dotted}") or self.resolve_name(dotted)
+
+    def resolve_name(self, name, depth=0):
+        if not name or depth > 20:
+            return None
+        if name in self.defs:
+            return name
+        parts = name.split(".")
+        for k in range(len(parts), 0, -1):
+            prefix, rest = ".".join(parts[:k]), parts[k:]
+            target = self.aliases.get(prefix)
+            if target and target != prefix:
+                found = self.resolve_name(".".join([target] + rest), depth + 1)
+                if found:
+                    return found
+            if rest and prefix in self.defs:
+                if self.defs[prefix]["kind"] in CLASS_KINDS and len(rest) == 1:
+                    return self.lookup_member(prefix, rest[0], set())
+                return None
+        return None
+
+    def lookup_member(self, class_id, name, seen):
+        if class_id in seen:
+            return None
+        seen.add(class_id)
+        member = f"{class_id}.{name}"
+        if member in self.defs:
+            return member
+        for base in self.defs[class_id].get("base_ids", []):
+            found = self.lookup_member(base, name, seen)
+            if found:
+                return found
+        return None
+
+    def resolve_ref(self, ref, module=None, cls=None, classes_only=False, top_only=False):
+        """Map a name written in the docs to an entity id, or None if unknown or ambiguous.
+
+        top_only: a one-word name may only mean a class, function or module (used for literals)."""
+        ref = re.sub(r"\(.*$", "", ref.strip().lstrip("~!.").strip())
+        if not IDENT_RE.match(ref or "-"):
+            return None
+        candidates = []
+        if cls:
+            if "." not in ref:
+                found = self.lookup_member(cls, ref, set())
+                if found:
+                    return found
+            candidates.append(f"{self.defs[cls]['name']}.{ref}")
+        if module:
+            candidates.append(f"{module}.{ref}")
+        candidates.append(ref)
+        for candidate in candidates:
+            hits = self.index.get(candidate)
+            if hits and len(hits) == 1:
+                found = next(iter(hits))
+            else:
+                found = self.resolve_name(candidate)
+            if found and (not classes_only or self.defs[found]["kind"] in CLASS_KINDS):
+                return found
+        hits = self.suffix.get(ref, set())
+        public = {h for h in hits if not is_private_name(self.defs[h]["name"])}
+        hits = public or hits
+        if classes_only:
+            hits = {h for h in hits if self.defs[h]["kind"] in CLASS_KINDS}
+        if top_only and "." not in ref:
+            hits = {h for h in hits if self.defs[h]["kind"] in TOP_KINDS}
+        if len(hits) == 1:
+            return next(iter(hits))
+        return None
+
+    def class_of(self, eid):
+        while eid:
+            entity = self.defs[eid]
+            if entity["kind"] in CLASS_KINDS:
+                return eid
+            eid = entity["parent"]
+        return None
+
+    # ---------------------------------------------------------------- claims
+
+    def add_claim(self, eid, claim):
+        target = self.claims.setdefault(eid, []) if eid else self.general
+        key = (eid, claim["kind"], re.sub(r"\W+", " ", claim["text"].lower()).strip(), claim.get("code", ""),
+               claim.get("expected", ""))
+        if key in self.claim_keys:
+            first = self.claim_keys[key]
+            if claim["source"] != first["source"] and claim["source"] not in first.get("also_in", []):
+                first.setdefault("also_in", []).append(claim["source"])
+            return
+        self.claim_keys[key] = claim
+        target.append(claim)
+
+    def emit(self, block, owner, origin, file, sessions, markdown, targets):
+        where = owner or block.get("entity")
+        if block["type"] == "prose":
+            self.emit_prose(block, where, origin, file, markdown, targets)
+        elif block["type"] == "doctest":
+            session = sessions.setdefault(block.get("session", 0), {"setup": [], "vars": {}})
+            self.emit_doctest(block, where, origin, file, session)
+        elif block["type"] == "code":
+            self.emit_code(block, where, origin, file)
+
+    def emit_prose(self, block, where, origin, file, markdown, targets):
+        inline = Inline(block["text"], markdown, targets)
+        field = block.get("field")
+        if field:
+            body, _ = inline.restore(inline.text)
+            kind, name, typ = field
+            if kind == "param":
+                head = f"Parameter `{name}`" + (f" ({typ})" if typ else "")
+            elif kind == "type":
+                kind, head, body = "param", f"Parameter `{name}` has type {typ or body}", ""
+            elif kind == "attribute":
+                head = f"Attribute `{name}`" + (f" ({typ})" if typ else "")
+            elif kind == "returns":
+                head = "Returns" + (f" {typ}" if typ else "")
+            elif kind == "rtype":
+                kind, head, body = "returns", f"Return type: {typ or body}", ""
+            else:
+                head = "Raises" + (f" `{name}`" if name else "")
+            text = f"{head}: {body}" if body else head
+            claim = {"text": truncate(text), "kind": kind}
+            if field[0] == "raises" and name:
+                claim["exception"] = name
+            if field[0] in ("param", "type", "attribute") and name:
+                claim["param"] = name
+            claim["source"] = {"file": file, "line": block["line"], "origin": origin}
+            if where:
+                self.add_claim(where, claim)
+            elif not block.get("skip"):
+                self.add_claim(None, claim)
+            return
+        plain = inline.text
+        nlines = max(1, block.get("nlines", 1))
+        for sentence in split_sentences(plain):
+            text, spans = inline.restore(sentence)
+            if is_noise(text, 1 if origin.startswith("docstring") else 2):
+                continue
+            offset = max(0, plain.find(sentence))
+            line = block["line"] + min(nlines - 1, int(nlines * offset / max(1, len(plain))))
+            claim = {"text": truncate(text), "kind": classify(text, block.get("tag")),
+                     "source": {"file": file, "line": line, "origin": origin}}
+            if where:
+                self.add_claim(where, claim)
+                continue
+            ids = []
+            for span in spans:
+                if span["ref"]:
+                    found = self.resolve_ref(span["ref"], block.get("module"),
+                                             top_only=span["role"] in ("literal", "default"))
+                    if found and found not in ids:
+                        ids.append(found)
+            for word in CAMEL_RE.findall(re.sub(r"`[^`]*`", " ", text)):
+                found = self.resolve_ref(word, block.get("module"), classes_only=True)
+                if found and found not in ids:
+                    ids.append(found)
+            if 1 <= len(ids) <= MAX_MENTIONS:
+                for eid in ids:
+                    self.add_claim(eid, dict(claim, via="mentioned in " + origin))
+            elif not block.get("skip") and (spans or BEHAVIOR_RE.search(text)):
+                if block.get("subject"):
+                    claim["subject"] = block["subject"]
+                if ids:
+                    claim["mentions"] = [self.defs[i]["name"] for i in ids]
+                self.add_claim(None, claim)
+
+    def code_mentions(self, code, session, module):
+        found = []
+        for ident in CODE_IDENT_RE.findall(code):
+            head, _, rest = ident.partition(".")
+            eid = None
+            if head in session["vars"]:
+                cls = session["vars"][head]
+                if rest and self.defs[cls]["kind"] in CLASS_KINDS:
+                    eid = self.lookup_member(cls, rest.split(".")[0], set()) or cls
+                else:
+                    eid = cls
+            elif ident not in ("self", "cls", "print", "assert"):
+                eid = self.resolve_ref(ident, module)
+                if eid and "." not in ident and self.defs[eid]["kind"] not in TOP_KINDS:
+                    eid = None
+            if eid and eid not in found:
+                found.append(eid)
+        # keep the most specific: drop a class when one of its own members is also named
+        found = [e for e in found if not any(self.defs[o]["parent"] == e for o in found)]
+        if any(self.defs[e]["kind"] != "module" for e in found):
+            found = [e for e in found if self.defs[e]["kind"] != "module"]
+        return found
+
+    def track_assignment(self, code, session, module):
+        """Remember which package class or decorator each name in an example stands for."""
+        names = session["vars"]
+        decorator = None
+
+        def lookup(name):
+            head, _, rest = name.partition(".")
+            if head in names and not rest:
+                return names[head]
+            return self.resolve_ref(name, module)
+
+        for line in code.splitlines():
+            match = re.match(r"^\s*class\s+(\w+)\s*\(\s*([\w.]+)", line)
+            if match:
+                base = lookup(match.group(2))
+                if base and self.defs[base]["kind"] in CLASS_KINDS:
+                    names[match.group(1)] = base
+                continue
+            match = re.match(r"^\s*@\s*([\w.]+)", line)
+            if match:
+                found = lookup(match.group(1))
+                decorator = decorator or (found if found and self.defs[found]["kind"] == "function" else None)
+                continue
+            match = re.match(r"^\s*(?:async\s+)?def\s+(\w+)", line)
+            if match:
+                if decorator and indent_of(line) == 0:
+                    names[match.group(1)] = decorator
+                decorator = None
+                continue
+            match = ASSIGN_CALL_RE.match(line)
+            if match:
+                found = lookup(match.group(2))
+                if found and self.defs[found]["kind"] in CLASS_KINDS:
+                    names[match.group(1)] = found
+                elif match.group(1) in names:
+                    del names[match.group(1)]
+
+    def emit_doctest(self, block, where, origin, file, session):
+        module = block.get("module")
+        for step in block["steps"]:
+            code, expected = step["code"], step["expected"]
+            if expected:
+                ids = [where] if where else self.code_mentions(code, session, module)
+                claim = {"text": "", "kind": "example", "code": code, "expected": expected}
+                lines = [l for l in expected.splitlines() if l.strip()]
+                if lines and lines[0].startswith("Traceback"):
+                    error = lines[-1].strip()
+                    claim["kind"] = "raises"
+                    claim["exception"] = error.split(":")[0].split(".")[-1]
+                    claim["text"] = f"`{one_line(code)}` raises {truncate(error, 160)}"
+                else:
+                    claim["text"] = f"`{one_line(code)}` gives `{one_line(expected)}`"
+                if session["setup"]:
+                    claim["setup"] = session["setup"][-MAX_SETUP:]
+                claim["source"] = {"file": file, "line": step["line"], "origin": origin}
+                if 1 <= len(ids) <= MAX_MENTIONS:
+                    for eid in ids:
+                        self.add_claim(eid, dict(claim))
+                elif not block.get("skip"):
+                    self.add_claim(None, claim)
+            self.track_assignment(code, session, module)
+            session["setup"].append(code)
+
+    def emit_code(self, block, where, origin, file):
+        code = block["code"]
+        lang = (block.get("lang") or "").split()[0].lower() if block.get("lang") else ""
+        first = next((l for l in code.splitlines() if l.strip()), "")
+        if lang in SHELL_LANGS or first.lstrip().startswith(("$ ", "pip ", "% ", "> ", "python -m pip", "conda ")):
+            return
+        if not re.search(r"[A-Za-z_]\w*\s*[(=.\[]|^\s*(import|from|def|class|@)\b", code, re.M):
+            return
+        session = {"setup": [], "vars": {}}
+        self.track_assignment(code, session, block.get("module"))
+        ids = [where] if where else self.code_mentions(code, session, block.get("module"))
+        meaningful = next((l.strip() for l in code.splitlines()
+                           if l.strip() and not l.lstrip().startswith(("#", "import ", "from "))), first.strip())
+        claim = {"text": f"Usage example: `{truncate(meaningful, 120)}`", "kind": "usage", "code": trim_code(code)}
+        if block.get("output"):
+            claim["kind"] = "example"
+            claim["expected"] = block["output"]
+            claim["text"] = f"Running the example prints `{one_line(block['output'])}`"
+        claim["source"] = {"file": file, "line": block["line"], "origin": origin}
+        if 1 <= len(ids) <= MAX_MENTIONS:
+            for eid in ids:
+                self.add_claim(eid, dict(claim))
+        elif not block.get("skip") and claim["kind"] == "example":
+            self.add_claim(None, claim)
+
+    # ---------------------------------------------------------------- docstrings
+
+    def docstring_claims(self):
+        for entity in list(self.defs.values()):
+            doc = entity["docstring"]
+            if not doc:
+                continue
+            origin = entity.get("doc_origin", "docstring")
+            blocks = RstParser(self, doc, entity["doc_line"] or entity["line"], entity["id"], entity["module"],
+                               frozenset()).parse()
+            sessions = {}
+            for block in blocks:
+                if entity["doc_fixed"]:
+                    block["line"] = entity["doc_line"] or entity["line"]
+                    for step in block.get("steps", []):
+                        step["line"] = block["line"]
+                block["module"] = entity["module"]
+                self.emit(block, entity["id"], origin, entity["file"], sessions, False, frozenset())
+
+    # ---------------------------------------------------------------- README and docs
+
+    def doc_paths(self, extra):
+        paths = [p for p in sorted(self.root.iterdir()) if p.is_file() and p.name.lower().startswith("readme")]
+        for folder in DOC_DIRS:
+            base = self.root / folder
+            if base.is_dir():
+                for path in sorted(base.rglob("*")):
+                    rel = path.relative_to(base).parts
+                    if path.is_file() and path.suffix.lower() in DOC_SUFFIXES and \
+                            not any(part.startswith(("_", ".")) for part in rel) and not DOC_SKIP_FILE.search(path.name):
+                        paths.append(path)
+        for name in extra:
+            path = (self.root / name).resolve()
+            if path.is_file() and self.root in path.parents and path not in paths:
+                paths.append(path)
+        return paths
+
+    def docs_claims(self, extra):
+        main = sorted(self.roots)[0] if self.roots else None
+        for path in self.doc_paths(extra):
+            if path.stat().st_size > MAX_DOC_BYTES:
+                continue
+            rel = path.relative_to(self.root).as_posix()
+            origin = "readme" if path.name.lower().startswith("readme") else "docs"
+            text = path.read_text(encoding="utf-8", errors="replace")
+            markdown = path.suffix.lower() in (".md", ".markdown")
+            self.doc_files.append(rel)
+            if markdown:
+                parser = MarkdownParser(self, text, main)
+                targets = frozenset()
+            else:
+                targets = frozenset(m.group(1).strip().lower() for m in re.finditer(r"^\s*\.\.\s+_`?([^:`]+)`?:", text, re.M))
+                parser = RstParser(self, text, 1, None, main, targets, file=rel)
+            sessions = {}
+            for block in parser.parse():
+                block.setdefault("module", main)
+                self.emit(block, None, origin, rel, sessions, markdown, targets)
+
+    def note_documented(self, eid, signature, file, line):
+        self.documented.setdefault(eid, []).append({"file": file, "line": line})
+        if signature:
+            sigs = self.doc_signatures.setdefault(eid, [])
+            if signature not in sigs:
+                sigs.append(signature)
+
+    # ---------------------------------------------------------------- output
+
+    def included(self, entity) -> bool:
+        if self.include_private or entity["id"] in self.documented:
+            return True
+        if is_private_name(entity["name"]):
+            return False
+        return not (entity["kind"] == "module" and not entity["docstring"] and not self.claims.get(entity["id"]))
+
+    def useful_alias(self, entity, name) -> bool:
+        """Another public name of the entity, leaving out modules that merely import it."""
+        if name == entity["name"] or is_private_name(name):
+            return False
+        own = entity["qualname"].rsplit(".", 1)[-1] if entity["qualname"] else entity["module"].rsplit(".", 1)[-1]
+        if entity["parent"]:
+            return name.rsplit(".", 1)[-1] != own and name.rsplit(".", 1)[0] == entity["name"].rsplit(".", 1)[0]
+        return name.rsplit(".", 1)[0] in self.roots | {entity["module"]} or name.rsplit(".", 1)[-1] != own
+
+    def inherited(self, entity):
+        own = set(entity["members"])
+        result, seen = {}, set()
+        stack = list(entity.get("base_ids", []))
+        while stack:
+            base = stack.pop(0)
+            if base in seen:
+                continue
+            seen.add(base)
+            names = [m for m in self.defs[base]["members"] if m not in own and not is_private_name(m)
+                     and m not in ("__init__", "__new__")]
+            own |= set(names)
+            if names:
+                result[self.defs[base]["name"]] = names
+            stack.extend(self.defs[base].get("base_ids", []))
+        return result
+
+    def to_json(self, name_filter=None, kinds=None, compact=False, general=True):
+        entities = []
+        for entity in self.defs.values():
+            if not self.included(entity):
+                continue
+            if name_filter and not any(name_filter.search(n) for n in entity["names"]):
+                continue
+            out = {"name": entity["name"], "kind": entity["kind"]}
+            if entity["signature"]:
+                out["signature"] = entity["signature"]
+            if entity["id"] in self.doc_signatures:
+                out["documented_signatures"] = self.doc_signatures[entity["id"]]
+            out["defined_in"] = f"{entity['file']}:{entity['line']}"
+            others = sorted(n for n in entity["names"] if self.useful_alias(entity, n))
+            if others:
+                out["aliases"] = others
+            if entity["kind"] in CLASS_KINDS:
+                if entity.get("bases"):
+                    out["bases"] = [self.defs[b]["name"] for b in entity.get("base_ids", [])] + \
+                        [b for b in entity["bases"] if not self.resolve_in_module(entity["module"], re.sub(r"\[.*$", "", b))]
+                members = [m for m in entity["members"] if self.included(self.defs[f"{entity['id']}.{m}"])]
+                if members:
+                    out["members"] = members
+                inherited = self.inherited(entity)
+                if inherited:
+                    out["inherited"] = inherited
+            if entity.get("accessors"):
+                out["accessors"] = entity["accessors"]
+            if entity.get("decorators") and not compact:
+                out["decorators"] = entity["decorators"]
+            if not compact:
+                out["docstring"] = entity["docstring"]
+            if entity["id"] in self.documented and not compact:
+                out["documented_in"] = self.documented[entity["id"]]
+            out["claims"] = self.export_claims(self.claims.get(entity["id"], []), kinds, compact)
+            entities.append(out)
+        counts = {}
+        for item in entities:
+            for claim in item["claims"]:
+                counts[claim["kind"]] = counts.get(claim["kind"], 0) + 1
+        result = {
+            "tool": "extract_spec",
+            "packages": sorted(self.roots),
+            "sources": {"code": self.code_files, "docs": self.doc_files},
+            "imported": self.imported,
+        }
+        if self.import_errors:
+            result["import_errors"] = self.import_errors
+        result["stats"] = {"entities": len(entities), "claims": sum(counts.values()), "claims_by_kind": counts}
+        result["entities"] = entities
+        if general:
+            result["general_claims"] = self.export_claims(self.general, kinds, compact)
+        return result
+
+    @staticmethod
+    def export_claims(claims, kinds, compact):
+        exported = []
+        for claim in claims:
+            if kinds and claim["kind"] not in kinds:
+                continue
+            item = dict(claim)
+            if compact:
+                item.pop("also_in", None)
+                item.pop("via", None)
+            exported.append(item)
+        return exported
+
+
+# ----------------------------------------------------------------------------------------------------
+# reStructuredText (docs and docstrings)
+# ----------------------------------------------------------------------------------------------------
+
+class RstParser:
+    """Splits reST into prose paragraphs, field-list items, doctests and code blocks, each tagged with
+    the class or function the surrounding directive (or docstring) documents."""
+
+    def __init__(self, spec: Spec, text, first_line, entity, module, targets, file=None):
+        self.spec = spec
+        self.lines = text.expandtabs().split("\n")
+        self.first_line = first_line
+        self.file = file
+        self.targets = targets
+        self.blocks: list[dict] = []
+        self.stack = [{"indent": -1, "entity": entity, "cls": spec.class_of(entity) if entity else None,
+                       "tag": None, "subject": None}]
+        self.module = module
+        self.section_levels: list = []
+        self.skip_level = None
+        self.session = 0
+        self.fsec = None
+        self.para = None
+
+    def ln(self, i):
+        return self.first_line + i
+
+    def flush(self):
+        para, self.para = self.para, None
+        if para is None:
+            return
+        text = " ".join(s.strip() for s in para["lines"]).strip()
+        if text or para["field"]:
+            self.blocks.append({"type": "prose", "text": text, "line": para["line"], "nlines": len(para["lines"]),
+                                "entity": para["entity"], "tag": para["tag"], "field": para["field"],
+                                "skip": para["skip"], "subject": para["subject"], "module": self.module,
+                                "session": self.session})
+
+    def new_para(self, i, ind, text, field=None, tag=None):
+        self.flush()
+        top = self.stack[-1]
+        self.para = {"lines": [text] if text else [], "line": self.ln(i), "indent": ind, "entity": top["entity"],
+                     "tag": tag or top["tag"], "field": field, "skip": self.skip_level is not None,
+                     "subject": top["subject"]}
+
+    def body_end(self, i, base):
+        n = len(self.lines)
+        while i < n and (not self.lines[i].strip() or indent_of(self.lines[i]) > base):
+            i += 1
+        return i
+
+    def add_code(self, start, end, directive, lang=None):
+        body = self.lines[start:end]
+        s, e = 0, len(body)
+        while s < e and not body[s].strip():
+            s += 1
+        while e > s and not body[e - 1].strip():
+            e -= 1
+        if s >= e:
+            return
+        code = textwrap.dedent("\n".join(body[s:e]))
+        top = self.stack[-1]
+        base = {"line": self.ln(start + s), "entity": top["entity"], "skip": self.skip_level is not None,
+                "module": self.module, "session": self.session}
+        if directive == "testoutput":
+            last = self.blocks[-1] if self.blocks else None
+            if last and last["type"] == "code" and last.get("directive") == "testcode" and "output" not in last:
+                last["output"] = code
+            return
+        if any(l.lstrip().startswith(">>>") for l in code.split("\n")):
+            self.blocks.append(dict(base, type="doctest", steps=parse_doctest(code.split("\n"), base["line"])))
+        else:
+            self.blocks.append(dict(base, type="code", code=code, directive=directive, lang=lang))
+
+    def heading(self, text, style):
+        self.flush()
+        del self.stack[1:]
+        if style not in self.section_levels:
+            self.section_levels.append(style)
+        level = self.section_levels.index(style)
+        self.session += 1
+        low = text.strip().lower().rstrip(":")
+        kind = SECTION_FIELD.get(low)
+        self.fsec = {"kind": kind, "min": 0, "item": None, "style": "numpy"} if kind else None
+        if self.skip_level is not None and level <= self.skip_level:
+            self.skip_level = None
+        if self.skip_level is None and SKIP_HEADING.search(text.strip()):
+            self.skip_level = level
+
+    def field_item(self, kind, text, style):
+        """One item of a Google or numpy style section -> (kind, name, type), description."""
+        if style == "numpy":  # "name : type" or just "type"; the description is on the next lines
+            name, colon, typ = text.partition(" : ") if " : " in text else text.partition(":")
+            if kind in ("param", "attribute"):
+                return (kind, name.strip(), typ.strip() or None), ""
+            if kind == "raises":
+                return ("raises", text.strip(), None), ""
+            return ("returns", None, (typ if colon else name).strip() or None), ""
+        if kind in ("param", "attribute"):
+            m = re.match(r"^(\*{0,2}[\w.]+(?:\s*,\s*\*{0,2}\w+)*)\s*(?:\(([^)]*)\))?\s*(?::\s*(.*))?$", text)
+            if m:
+                return (kind, m.group(1), m.group(2)), m.group(3) or ""
+            return (kind, None, None), text
+        m = re.match(r"^([\w.\[\], ]+?)\s*:\s*(.*)$", text)
+        if m and (kind == "raises" or not re.search(r"\s", m.group(1).strip())):
+            if kind == "raises":
+                return ("raises", m.group(1).strip(), None), m.group(2)
+            return ("returns", None, m.group(1).strip()), m.group(2)
+        if kind == "raises" and re.match(r"^[\w.]+$", text):
+            return ("raises", text, None), ""
+        if kind == "returns" and re.match(r"^[\w.\[\], |]+$", text) and len(text) < 40:
+            return ("returns", None, text), ""
+        return (kind, None, None), text
+
+    @staticmethod
+    def rst_field(name, arg, rest):
+        name = name.lower()
+        words = (arg or "").split()
+        if name in ("param", "parameter", "arg", "argument", "key", "keyword", "kwarg", "kwparam"):
+            if not words:
+                return None
+            return ("param", words[-1], " ".join(words[:-1]) or None), rest
+        if name == "type" and words:
+            return ("type", words[-1], rest or None), ""
+        if name in ("returns", "return", "yields", "yield"):
+            return ("returns", None, None), rest
+        if name in ("rtype", "ytype"):
+            return ("rtype", None, rest or None), ""
+        if name in ("raises", "raise", "except", "exception", "throws"):
+            return ("raises", " ".join(words) or None, None), rest
+        if name in ("ivar", "var", "cvar") and words:
+            return ("attribute", words[-1], " ".join(words[:-1]) or None), rest
+        return False
+
+    def parse(self):
+        lines, n = self.lines, len(self.lines)
+        i = 0
+        while i < n:
+            line = lines[i]
+            stripped = line.strip()
+            if not stripped:
+                self.flush()
+                i += 1
+                continue
+            ind = indent_of(line)
+            while len(self.stack) > 1 and ind <= self.stack[-1]["indent"]:
+                self.flush()
+                self.stack.pop()
+
+            nxt = lines[i + 1].strip() if i + 1 < n else ""
+            if is_rule(stripped) and i + 2 < n and nxt and not is_rule(nxt) and lines[i + 2].strip() == stripped:
+                self.heading(nxt, (stripped[0], True))
+                i += 3
+                continue
+            if self.para is None and not is_rule(stripped) and is_rule(nxt) and \
+                    len(nxt) >= max(3, int(len(stripped) * 0.6)) and indent_of(lines[i + 1]) == ind \
+                    and not stripped.startswith(".. "):
+                self.heading(stripped, (nxt[0], False))
+                i += 2
+                continue
+            if is_rule(stripped) and self.para is None:
+                i += 1
+                continue
+
+            # Google / numpy style parameter sections
+            if self.fsec is not None:
+                fs = self.fsec
+                if ind < fs["min"] or (DIRECTIVE_RE.match(line) and ind <= fs["min"]):
+                    self.flush()
+                    self.fsec = fs = None
+                elif not stripped.startswith(">>>"):
+                    if fs["item"] is None or ind <= fs["item"]:
+                        fs["item"] = ind
+                        field, desc = self.field_item(fs["kind"], stripped, fs["style"])
+                        self.new_para(i, ind, desc, field=field)
+                    elif self.para is not None:
+                        self.para["lines"].append(stripped)
+                    else:
+                        self.new_para(i, ind, stripped)
+                    i += 1
+                    continue
+
+            if stripped.startswith(">>>"):
+                self.flush()
+                j = i
+                while j < n and lines[j].strip():
+                    j += 1
+                top = self.stack[-1]
+                self.blocks.append({"type": "doctest", "steps": parse_doctest(lines[i:j], self.ln(i)),
+                                    "line": self.ln(i), "entity": top["entity"], "skip": self.skip_level is not None,
+                                    "module": self.module, "session": self.session})
+                i = j
+                continue
+
+            if self.para is None and GOOGLE_RE.match(stripped):
+                key = stripped.rstrip(":").strip().lower()
+                kind = SECTION_FIELD.get(key)
+                self.fsec = {"kind": kind, "min": ind + 1, "item": None, "style": "google"} if kind else None
+                i += 1
+                continue
+
+            match = DIRECTIVE_RE.match(line)
+            if match:
+                i = self.directive(i, ind, match.group(2).split(":")[-1].lower(), (match.group(3) or "").strip())
+                continue
+            if stripped.startswith(".. ") or stripped == "..":
+                self.flush()
+                i = self.body_end(i + 1, ind)
+                continue
+            if stripped.startswith("__ "):
+                i += 1
+                continue
+
+            field = FIELD_RE.match(stripped)
+            if field:
+                parsed = self.rst_field(field.group(1), field.group(2), field.group(3) or "")
+                if parsed is False:
+                    self.flush()
+                    i = self.body_end(i + 1, ind)
+                    continue
+                if parsed is not None:
+                    self.new_para(i, ind, parsed[1], field=parsed[0])
+                    i += 1
+                    continue
+
+            bullet = BULLET_RE.match(stripped)
+            if bullet:
+                self.new_para(i, ind + len(bullet.group(1)) + 1, bullet.group(2))
+            elif self.para is None:
+                self.new_para(i, ind, stripped)
+            else:
+                self.para["lines"].append(stripped)
+
+            if stripped.endswith("::"):
+                last = self.para["lines"][-1] if self.para["lines"] else ""
+                if last == "::":
+                    self.para["lines"].pop()
+                elif last.endswith(" ::"):
+                    self.para["lines"][-1] = last[:-3]
+                else:
+                    self.para["lines"][-1] = last[:-1]
+                base = self.para["indent"]
+                self.flush()
+                end = self.body_end(i + 1, base)
+                self.add_code(i + 1, end, "literal")
+                i = end
+                continue
+            i += 1
+        self.flush()
+        return self.blocks
+
+    def directive(self, i, ind, name, arg):
+        self.flush()
+        lines, n = self.lines, len(self.lines)
+        j = i + 1
+        options = {}
+        while j < n and lines[j].strip() and indent_of(lines[j]) > ind and OPTION_RE.match(lines[j].strip()):
+            option = OPTION_RE.match(lines[j].strip())
+            options[option.group(1)] = option.group(2) or ""
+            j += 1
+        top = self.stack[-1]
+        if name in ENTITY_DIRECTIVES:
+            m = re.match(r"^([\w.]+)\s*(\(.*\))?\s*(->.*)?$", arg)
+            target, signature = (m.group(1), (m.group(2) or "") + (" " + m.group(3) if m.group(3) else "")) if m \
+                else (arg.split("(")[0].strip(), "")
+            eid = self.spec.resolve_ref(target, self.module, top["cls"]) if target else None
+            more = []
+            while j < n and lines[j].strip() and indent_of(lines[j]) > ind and \
+                    re.match(r"^[\w.]+\s*\(.*\)\s*(->.*)?$", lines[j].strip()):
+                more.append(lines[j].strip()[len(lines[j].strip().split("(")[0]):].strip())
+                j += 1
+            if eid:
+                for sig in [signature.strip()] + more:
+                    self.spec.note_documented(eid, sig or None, self.file or "", self.ln(i))
+                for member in re.split(r"[,\s]+", options.get("members", "")):
+                    found = self.spec.resolve_ref(member, None, eid) if member else None
+                    if found:
+                        self.spec.note_documented(found, None, self.file or "", self.ln(i))
+            cls = eid if eid and self.spec.defs[eid]["kind"] in CLASS_KINDS else top["cls"]
+            self.stack.append({"indent": ind, "entity": eid, "cls": cls, "tag": None,
+                               "subject": None if eid else (target or arg)})
+            self.session += 1
+            return j
+        if name in MODULE_DIRECTIVES:
+            if arg and arg.split()[0] != "None":
+                self.module = arg.split()[0]
+            self.stack.append(dict(top, indent=ind))
+            return j
+        if name in CODE_DIRECTIVES:
+            end = self.body_end(j, ind)
+            self.add_code(j, end, name, lang=arg or None)
+            return end
+        if name not in ADMONITIONS:
+            return self.body_end(j, ind)
+        self.stack.append(dict(top, indent=ind, tag=name))
+        if arg:
+            if name in VERSION_LABELS:
+                version, _, rest = arg.partition(" ")
+                text = f"{VERSION_LABELS[name]} {version}." + (f" {rest}" if rest else "")
+            else:
+                text = arg
+            self.new_para(i, ind + 1, text, tag=name)
+            if name in VERSION_LABELS or name == "rubric":
+                self.flush()
+        return j
+
+
+# ----------------------------------------------------------------------------------------------------
+# Markdown (README.md, mkdocs)
+# ----------------------------------------------------------------------------------------------------
+
+class MarkdownParser:
+    def __init__(self, spec: Spec, text, module):
+        self.spec = spec
+        self.lines = text.expandtabs().split("\n")
+        self.module = module
+        self.blocks: list[dict] = []
+        self.entity = None
+        self.skip_level = None
+        self.session = 0
+        self.para = None
+
+    def flush(self):
+        para, self.para = self.para, None
+        if para:
+            text = " ".join(s.strip() for s in para["lines"]).strip()
+            if text:
+                self.blocks.append({"type": "prose", "text": text, "line": para["line"], "nlines": len(para["lines"]),
+                                    "entity": self.entity, "tag": para["tag"], "field": None,
+                                    "skip": self.skip_level is not None, "module": self.module,
+                                    "session": self.session})
+
+    def heading(self, text, level):
+        self.flush()
+        self.entity = None
+        self.session += 1
+        if self.skip_level is not None and level <= self.skip_level:
+            self.skip_level = None
+        if self.skip_level is None and SKIP_HEADING.search(text.strip()):
+            self.skip_level = level
+
+    def code(self, body, first, lang):
+        code = textwrap.dedent("\n".join(body)).strip("\n")
+        if not code.strip():
+            return
+        base = {"line": first, "entity": self.entity, "skip": self.skip_level is not None, "module": self.module,
+                "session": self.session}
+        if any(l.lstrip().startswith(">>>") for l in code.split("\n")):
+            self.blocks.append(dict(base, type="doctest", steps=parse_doctest(code.split("\n"), first)))
+        else:
+            self.blocks.append(dict(base, type="code", code=code, directive="fence", lang=lang))
+
+    def parse(self):
+        lines, n = self.lines, len(self.lines)
+        i = 0
+        while i < n:
+            line = lines[i]
+            stripped = line.strip()
+            fence = re.match(r"^\s*(`{3,}|~{3,})\s*([\w+.-]*)", line)
+            if fence:
+                self.flush()
+                marker, lang = fence.group(1), fence.group(2) or None
+                j = i + 1
+                while j < n and not lines[j].strip().startswith(marker):
+                    j += 1
+                self.code(lines[i + 1:j], i + 2, lang)
+                i = j + 1
+                continue
+            if not stripped:
+                self.flush()
+                i += 1
+                continue
+            heading = re.match(r"^(#{1,6})\s+(.*?)\s*#*\s*$", stripped)
+            if heading:
+                self.heading(heading.group(2), len(heading.group(1)))
+                i += 1
+                continue
+            nxt = lines[i + 1].strip() if i + 1 < n else ""
+            if self.para is None and re.match(r"^(=+|-+)$", nxt) and not BULLET_RE.match(stripped):
+                self.heading(stripped, 1 if nxt[0] == "=" else 2)
+                i += 2
+                continue
+            doc = re.match(r"^:::\s+([\w.]+)", stripped)
+            if doc:
+                self.flush()
+                self.entity = self.spec.resolve_ref(doc.group(1), self.module)
+                if self.entity:
+                    self.spec.note_documented(self.entity, None, "", i + 1)
+                i = self.skip_indented(i + 1)
+                continue
+            if stripped.startswith((">>>",)):
+                self.flush()
+                j = i
+                while j < n and lines[j].strip():
+                    j += 1
+                self.blocks.append({"type": "doctest", "steps": parse_doctest(lines[i:j], i + 1), "line": i + 1,
+                                    "entity": self.entity, "skip": self.skip_level is not None,
+                                    "module": self.module, "session": self.session})
+                i = j
+                continue
+            if self.para is None and indent_of(line) >= 4:
+                j = i
+                while j < n and (not lines[j].strip() or indent_of(lines[j]) >= 4):
+                    j += 1
+                self.code(lines[i:j], i + 1, None)
+                i = j
+                continue
+            if stripped.startswith(("<", "[![", "![", "|")) or re.match(r"^\[[^\]]+\]:\s", stripped):
+                self.flush()
+                i += 1
+                continue
+            bullet = BULLET_RE.match(stripped)
+            quote = stripped.startswith(">")
+            text = bullet.group(2) if bullet else stripped.lstrip("> ") if quote else stripped
+            if bullet or self.para is None:
+                self.flush()
+                tag = None
+                admonition = re.match(r"^\[!(NOTE|WARNING|IMPORTANT|TIP|CAUTION)\]", text, re.I)
+                if admonition:
+                    tag, text = admonition.group(1).lower(), text[admonition.end():].strip()
+                self.para = {"lines": [text], "line": i + 1, "tag": tag}
+            else:
+                self.para["lines"].append(text)
+            i += 1
+        self.flush()
+        return self.blocks
+
+    def skip_indented(self, i):
+        while i < len(self.lines) and (not self.lines[i].strip() or indent_of(self.lines[i]) > 0):
+            i += 1
+        return i
+
+
+# ----------------------------------------------------------------------------------------------------
+
+def build(args) -> Spec:
+    root = Path.cwd().resolve()  # the workspace: the tool never reads outside it
+    spec = Spec(root, args.private)
+    spec.scan(args.package or [])
+    if not spec.modules:
+        print("extract_spec: found no Python package to scan (use --package)", file=sys.stderr)
+    if not args.no_import:
+        spec.enrich_at_runtime()
+    spec.finish_names()
+    spec.docs_claims(args.docs or [])   # docs first: they mark private names that are documented
+    spec.docstring_claims()
+    order = {"docstring": 0, "docstring (set at runtime)": 0, "readme": 1, "docs": 2}
+    for claims in spec.claims.values():  # docstring claims before docs claims
+        claims.sort(key=lambda c: order.get(c["source"]["origin"], 3))
+    return spec
+
+
+def main(argv=None) -> int:
+    sys.dont_write_bytecode = True  # importing the package must not leave __pycache__ in the workspace
+    argv = sys.argv[1:] if argv is None else argv
+    if "--help" in argv or "-h" in argv:
+        print(__doc__.strip())
+        return 0
+    parser = argparse.ArgumentParser(prog="extract_spec", add_help=False)
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--name")
+    parser.add_argument("--claims")
+    parser.add_argument("--compact", action="store_true")
+    parser.add_argument("-o", "--output")
+    parser.add_argument("--package", action="append")
+    parser.add_argument("--docs", action="append", help=argparse.SUPPRESS)
+    parser.add_argument("--private", action="store_true")
+    parser.add_argument("--no-import", action="store_true")
+    parser.add_argument("--no-general", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        name_filter = re.compile(args.name) if args.name else None
+    except re.error as error:
+        print(f"extract_spec: bad --name pattern: {error}", file=sys.stderr)
+        return 2
+    kinds = {k.strip() for k in args.claims.split(",") if k.strip()} if args.claims else None
+    spec = build(args)
+    result = spec.to_json(name_filter, kinds, args.compact, general=not (args.no_general or name_filter))
+    if args.list:
+        for item in result["entities"]:
+            signature = item.get("signature", "")
+            print(f"{item['name']}{signature if item['kind'] not in ('property', 'module') else ''}"
+                  f"  [{item['kind']}]  {len(item['claims'])} claims")
+        if "general_claims" in result:
+            print(f"(general claims: {len(result['general_claims'])})")
+        return 0
+    text = json.dumps(result, indent=1, ensure_ascii=False)
+    if args.output:
+        Path(args.output).write_text(text + "\n", encoding="utf-8")
+        print(f"wrote {args.output}: {result['stats']['entities']} entities, {result['stats']['claims']} claims")
+    else:
+        print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

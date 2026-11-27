@@ -1,0 +1,881 @@
+#!/usr/bin/env python3
+"""mutants: mutation testing. Finds small code changes that no test (tests/ and tests_new/) notices.
+
+Usage: mutants [--target NAME] [--budget S] [--max N] [--show N] [--no-witness] [--tests DIR ...]
+
+Makes one small change at a time to the package (< to <=, + to -, n to n+1, and to or, True to False,
+break to continue, a condition negated, ...) and runs the tests that execute the changed line. A mutant
+that every test still passes "survived": that behaviour is not pinned down by any test.
+For each survivor it also searches for an input on which the current code and the mutant behave
+differently, and prints the spec claims extract_spec found for the function (step 1).
+
+IMPORTANT: the current code has bugs, so a surviving mutant can be the CORRECT code. Never assert
+the current result just because it differs from the mutant: assert whichever result the spec promises.
+
+Options:
+  --target NAME  only mutate this class, function or Class.method (regex on the qualified name)
+  --budget S     seconds for running mutants (default 75)
+  --max N        most mutants to run (default 250, spread over the target)
+  --show N       most survivors to print (default 8)
+  --no-witness   do not search for inputs that tell current code and mutant apart
+  --tests DIR    test folders to run (default: tests and tests_new)
+  --seed N       random seed (default 1)
+  --package P    package to mutate (default: auto-detect)
+  --check-failing  for each test in tests_new that FAILS now: is there one small change to the code that
+                 makes it pass while every other test still passes? CONFIRMED tests point at a real bug;
+                 UNCONFIRMED ones are probably wrong expectations (false alarms)
+"""
+
+import argparse
+import ast
+import copy
+import importlib.abc
+import importlib.util
+import json
+import os
+import random
+import re
+import signal
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _searchlib as lib  # noqa: E402
+
+WITNESS_RUNS = 3000
+KILLED, SURVIVED, TIMEOUT, ERROR, UNCOVERED, NOT_RUN = "killed", "survived", "timeout", "error", "uncovered", "not run"
+
+
+# --------------------------------------------------------------------------------------- operators
+ROR = {ast.Lt: [ast.LtE, ast.Gt], ast.LtE: [ast.Lt, ast.GtE], ast.Gt: [ast.GtE, ast.Lt],
+       ast.GtE: [ast.Gt, ast.LtE], ast.Eq: [ast.NotEq], ast.NotEq: [ast.Eq], ast.Is: [ast.IsNot],
+       ast.IsNot: [ast.Is], ast.In: [ast.NotIn], ast.NotIn: [ast.In]}
+AOR = {ast.Add: [ast.Sub], ast.Sub: [ast.Add], ast.Mult: [ast.FloorDiv], ast.FloorDiv: [ast.Mult, ast.Div],
+       ast.Div: [ast.Mult, ast.FloorDiv], ast.Mod: [ast.FloorDiv], ast.LShift: [ast.RShift],
+       ast.RShift: [ast.LShift], ast.BitAnd: [ast.BitOr], ast.BitOr: [ast.BitAnd], ast.BitXor: [ast.BitAnd],
+       ast.Pow: [ast.Mult]}
+RELATIONAL = [ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq]
+ARITHMETIC = [ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod]
+# --check-failing undoes a bug, so it needs every replacement, not just the neighbours.
+ROR_FULL = {**ROR, **{op: [o for o in RELATIONAL if o is not op] for op in RELATIONAL}}
+AOR_FULL = {**AOR, **{op: [o for o in ARITHMETIC if o is not op] for op in ARITHMETIC}}
+SYMBOL = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Eq: "==", ast.NotEq: "!=", ast.Is: "is",
+          ast.IsNot: "is not", ast.In: "in", ast.NotIn: "not in", ast.Add: "+", ast.Sub: "-", ast.Mult: "*",
+          ast.FloorDiv: "//", ast.Div: "/", ast.Mod: "%", ast.LShift: "<<", ast.RShift: ">>", ast.BitAnd: "&",
+          ast.BitOr: "|", ast.BitXor: "^", ast.Pow: "**", ast.And: "and", ast.Or: "or"}
+
+
+@dataclass
+class Mutant:
+    mid: int
+    module: str
+    file: Path
+    line: int
+    scope: str          # qualified name of the enclosing function or class
+    node_index: int     # position of the node in ast.walk order of the module
+    op: str             # what to do, see apply()
+    arg: object
+    before: str
+    after: str
+    status: str = NOT_RUN
+    witness: str = ""
+
+
+def qualnames(tree):
+    """node -> qualified name of the function/class it is in."""
+    names = {}
+
+    def visit(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = f"{prefix}.{child.name}" if prefix else child.name
+                names[child] = name
+                visit(child, name)
+            else:
+                names[child] = prefix
+                visit(child, prefix)
+    visit(tree, "")
+    return names
+
+
+def skipped_nodes(tree):
+    """Docstrings, __all__/__version__, annotations and asserts: changing them tells nothing."""
+    skip = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.body \
+                and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant):
+            skip.update(ast.walk(node.body[0]))
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id.startswith("__") for t in node.targets):
+            skip.update(ast.walk(node))
+        if isinstance(node, (ast.Assert, ast.Raise)):
+            skip.update(ast.walk(node))   # changing an error message or an assert is noise
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for arg in node.args.args + node.args.kwonlyargs + node.args.posonlyargs:
+                if arg.annotation:
+                    skip.update(ast.walk(arg.annotation))
+            if node.returns:
+                skip.update(ast.walk(node.returns))
+        if isinstance(node, ast.AnnAssign):
+            skip.update(ast.walk(node.annotation))
+        if isinstance(node, ast.JoinedStr):
+            skip.update(ast.walk(node))
+    return skip
+
+
+def generate(module, file, tree, full=False):
+    """Every mutant of one module, in source order. full: all operator replacements (for repairs)."""
+    names, skip = qualnames(tree), skipped_nodes(tree)
+    ror, aor = (ROR_FULL, AOR_FULL) if full else (ROR, AOR)
+    found = []
+
+    def add(node, index, op, arg, before, after):
+        found.append(Mutant(0, module, file, node.lineno, names.get(node, ""), index, op, arg, before, after))
+
+    for index, node in enumerate(ast.walk(tree)):
+        if node in skip or not hasattr(node, "lineno"):
+            continue
+        if isinstance(node, ast.Compare):
+            for i, op in enumerate(node.ops):
+                for new in ror.get(type(op), []):
+                    after = copy.deepcopy(node)
+                    after.ops[i] = new()
+                    add(node, index, "cmp", (i, new), ast.unparse(node), ast.unparse(after))
+        elif isinstance(node, (ast.BinOp, ast.AugAssign)):
+            for new in aor.get(type(node.op), []):
+                if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add) and (
+                        isinstance(node.left, (ast.Constant, ast.JoinedStr)) and isinstance(getattr(node.left, "value", 0), str)):
+                    continue   # string concatenation
+                after = copy.deepcopy(node)
+                after.op = new()
+                add(node, index, "binop", new, short(node), short(after))
+        elif isinstance(node, ast.BoolOp):
+            new = ast.Or if isinstance(node.op, ast.And) else ast.And
+            after = copy.deepcopy(node)
+            after.op = new()
+            add(node, index, "boolop", new, short(node), short(after))
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.Not, ast.USub)):
+            add(node, index, "unary", None, short(node), short(node.operand))
+        elif isinstance(node, ast.Constant) and type(node.value) is int:
+            for delta in (1, -1):
+                add(node, index, "const", node.value + delta, repr(node.value), repr(node.value + delta))
+        elif isinstance(node, ast.Constant) and type(node.value) is bool:
+            add(node, index, "const", not node.value, repr(node.value), repr(not node.value))
+        elif isinstance(node, ast.Break):
+            add(node, index, "flow", ast.Continue, "break", "continue")
+        elif isinstance(node, ast.Continue):
+            add(node, index, "flow", ast.Break, "continue", "break")
+        if isinstance(node, (ast.If, ast.While, ast.IfExp)) and not isinstance(node.test, ast.Constant) and (
+                full or not isinstance(node.test, (ast.Compare, ast.UnaryOp, ast.BoolOp))):
+            add(node, index, "negate", None, short(node.test), f"not {short(node.test)}")
+    return found
+
+
+def short(node, limit=70):
+    text = " ".join(ast.unparse(node).split())
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def apply(tree, mutant):
+    """Change the module tree in place (only ever done in a forked child)."""
+    for index, node in enumerate(ast.walk(tree)):
+        if index != mutant.node_index:
+            continue
+        if mutant.op == "cmp":
+            i, new = mutant.arg
+            node.ops[i] = new()
+        elif mutant.op in ("binop", "boolop"):
+            node.op = mutant.arg()
+        elif mutant.op == "const":
+            node.value = mutant.arg
+        elif mutant.op == "unary":
+            replace(tree, node, node.operand)
+        elif mutant.op == "flow":
+            replace(tree, node, ast.copy_location(mutant.arg(), node))
+        elif mutant.op == "negate":
+            node.test = ast.copy_location(ast.UnaryOp(ast.Not(), node.test), node.test)
+        ast.fix_missing_locations(tree)
+        return tree
+    raise LookupError("mutant node not found")
+
+
+def replace(tree, old, new):
+    for parent in ast.walk(tree):
+        for name, value in ast.iter_fields(parent):
+            if value is old:
+                setattr(parent, name, new)
+                return
+            if isinstance(value, list):
+                for i, item in enumerate(value):
+                    if item is old:
+                        value[i] = new
+                        return
+
+
+# ---------------------------------------------------------------------------------- forked children
+class SourceFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """Imports one module from a given code object instead of its file."""
+
+    def __init__(self, module, file, code):
+        self.module, self.file, self.code = module, str(file), code
+
+    def find_spec(self, name, path, target=None):
+        if name != self.module:
+            return None
+        is_pkg = self.file.endswith("__init__.py")
+        return importlib.util.spec_from_file_location(
+            name, self.file, loader=self, submodule_search_locations=[str(Path(self.file).parent)] if is_pkg else None)
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        exec(self.code, module.__dict__)
+
+
+def fresh_package(packages):
+    for name in list(sys.modules):
+        if any(name == p or name.startswith(p + ".") for p in packages) or name.startswith(("tests.", "tests_new.")) \
+                or name in ("tests", "tests_new", "conftest"):
+            del sys.modules[name]
+    importlib.invalidate_caches()
+
+
+def install(mutant, trees, packages):
+    tree = apply(trees[mutant.module], mutant)
+    code = compile(tree, str(mutant.file), "exec")
+    fresh_package(packages)
+    sys.meta_path.insert(0, SourceFinder(mutant.module, mutant.file, code))
+
+
+def fork(work, timeout):
+    """Run work() in a child process. Returns (pid, read_fd)."""
+    read, write = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read)
+        code = 99
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+            signal.signal(signal.SIGALRM, signal.SIG_DFL)
+            signal.alarm(int(timeout) + 2)   # the parent kills it too; this is a second line of defence
+            result = work()
+            os.write(write, json.dumps(result).encode())
+            code = 0
+        except BaseException:
+            code = 98
+        finally:
+            os.close(write)
+            os._exit(code)
+    os.close(write)
+    return pid, read
+
+
+def run_one(work, timeout):
+    pid, fd = fork(work, timeout)
+    deadline = time.time() + timeout
+    data = b""
+    os.set_blocking(fd, False)
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+            if chunk:
+                data += chunk
+                continue
+            if chunk == b"":
+                break
+        except BlockingIOError:
+            pass
+        if time.time() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            break
+        time.sleep(0.005)
+    os.close(fd)
+    os.waitpid(pid, 0)
+    try:
+        return json.loads(data.decode()) if data else None
+    except json.JSONDecodeError:
+        return None
+
+
+def pytest_args(selection):
+    return [*QUIET, "-x", "-p", "no:randomly", *selection]
+
+
+class CoveragePlugin:
+    """Tracks which test is running, so lines can be mapped to the tests that execute them."""
+
+    def __init__(self, on_test_start=None):
+        self.current = -1
+        self.nodeids = []
+        self.failed = set()
+        self.on_test_start = on_test_start
+
+    def pytest_runtest_setup(self, item):
+        self.nodeids.append(item.nodeid)
+        self.current = len(self.nodeids) - 1
+        if self.on_test_start:
+            self.on_test_start()
+
+    def pytest_runtest_teardown(self, item):
+        self.current = -1
+
+    def pytest_runtest_logreport(self, report):
+        if report.failed:
+            self.failed.add(report.nodeid)
+
+    def pytest_collectreport(self, report):
+        if report.failed:
+            self.failed.add(report.nodeid or "<collection>")
+
+
+QUIET = ["-q", "-p", "no:cacheprovider", "--no-header", "-o", "addopts=", "-W", "ignore", "--tb=no"]
+
+
+def plain_run(test_dirs):
+    """Run the tests once without tracing: which of them fail on the current code?"""
+    import pytest
+    plugin = CoveragePlugin()
+    status = pytest.main([*QUIET, *test_dirs], plugins=[plugin])
+    return {"status": int(status), "failed": sorted(plugin.failed)}
+
+
+def coverage_run(files, test_dirs):
+    """Run every test once recording lines. Returns lines -> test indexes and the node ids."""
+    import pytest
+    wanted = {str(f) for f in files}
+    hits = {}
+    real = {}
+
+    def realpath(name):
+        if name not in real:
+            real[name] = os.path.realpath(name)
+        return real[name]
+
+    monitoring = getattr(sys, "monitoring", None)
+    if monitoring is not None:   # Python 3.12+: fast, and it creates no frame objects
+        tool = next((t for t in range(5, 0, -1) if monitoring.get_tool(t) is None), None)
+    if monitoring is not None and tool is not None:
+        plugin = CoveragePlugin(on_test_start=monitoring.restart_events)
+        monitoring.use_tool_id(tool, "mutants")
+
+        def on_line(code, line):
+            path = realpath(code.co_filename)
+            if path in wanted:
+                hits.setdefault(f"{path}:{line}", set()).add(plugin.current)
+            return monitoring.DISABLE   # once per test is enough; restart_events() re-arms it
+
+        monitoring.register_callback(tool, monitoring.events.LINE, on_line)
+        monitoring.set_events(tool, monitoring.events.LINE)
+        try:
+            status = pytest.main([*QUIET, *test_dirs], plugins=[plugin])
+        finally:
+            monitoring.set_events(tool, 0)
+            monitoring.free_tool_id(tool)
+    else:
+        plugin = CoveragePlugin()
+
+        def global_trace(frame, event, arg):
+            path = realpath(frame.f_code.co_filename)
+            if path not in wanted:
+                return None
+            key = path + ":"
+
+            def tracer(frame, event, arg):
+                if event == "line":
+                    hits.setdefault(key + str(frame.f_lineno), set()).add(plugin.current)
+                return tracer
+            return tracer
+
+        sys.settrace(global_trace)
+        try:
+            status = pytest.main([*QUIET, *test_dirs], plugins=[plugin])
+        finally:
+            sys.settrace(None)
+    return {"hits": {k: sorted(v) for k, v in hits.items()}, "nodeids": plugin.nodeids, "status": int(status)}
+
+
+# ------------------------------------------------------------------------------------------- main
+def choose(mutants, limit, rng):
+    """At most limit mutants, spread evenly over the functions they are in."""
+    if len(mutants) <= limit:
+        return mutants
+    groups = {}
+    for m in mutants:
+        groups.setdefault(m.scope, []).append(m)
+    for group in groups.values():
+        rng.shuffle(group)
+    chosen = []
+    while len(chosen) < limit:
+        for group in groups.values():
+            if group and len(chosen) < limit:
+                chosen.append(group.pop())
+    return sorted(chosen, key=lambda m: m.mid)
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if "--help" in argv or "-h" in argv:
+        print(__doc__.strip())
+        return 0
+    parser = argparse.ArgumentParser(prog="mutants", add_help=False)
+    parser.add_argument("--target")
+    parser.add_argument("--budget", type=float, default=75.0)
+    parser.add_argument("--max", type=int, default=250)
+    parser.add_argument("--show", type=int, default=8)
+    parser.add_argument("--no-witness", action="store_true")
+    parser.add_argument("--tests", nargs="+")
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--package", action="append")
+    parser.add_argument("--check-failing", action="store_true")
+    args = parser.parse_args(argv)
+    lib.limit_resources()   # no wall-clock thread: fork() and threads do not mix; each phase has its own deadline
+    started = time.time()
+
+    root = Path.cwd().resolve()
+    sys.path.insert(0, str(root))
+    packages = lib.find_packages(root, args.package)
+    files = lib.package_files(root, packages)
+    if not files:
+        print("mutants: found no package to mutate (use --package)")
+        return 2
+    test_dirs = args.tests or [d for d in ("tests", "tests_new") if (root / d).is_dir()]
+    test_dirs = [d for d in test_dirs if any((root / d).rglob("test*.py"))]
+    if not test_dirs:
+        print("mutants: no tests to run yet. Write some tests in tests_new/ first.")
+        return 2
+
+    trees, mutants = {}, []
+    for module, file in files.items():
+        try:
+            trees[module] = ast.parse(file.read_text())
+        except SyntaxError:
+            continue
+        mutants += generate(module, file, trees[module], full=args.check_failing)
+    for i, m in enumerate(mutants, 1):
+        m.mid = i
+    if args.check_failing:
+        return check_failing(mutants, trees, files, packages, root, test_dirs, started + args.budget)
+    if args.target:
+        try:
+            pattern = re.compile(r"(^|\.)" + args.target + r"($|\.)")
+        except re.error as error:
+            print(f"mutants: bad --target pattern: {error}")
+            return 2
+        mutants = [m for m in mutants if pattern.search(m.scope)]
+        if not mutants:
+            print(f"mutants: nothing to mutate in {args.target!r} (it should name a class, function or Class.method)")
+            return 2
+    total = len(mutants)
+    rng = random.Random(args.seed)
+    mutants = choose(mutants, args.max, rng)
+
+    # 1. One traced run: which tests execute which line, and is the suite green on the current code?
+    import pytest  # noqa: F401  imported once here so every child starts with it loaded
+    end = started + args.budget     # every phase shares this deadline (the shell stops commands at 120 s)
+    plain = run_one(lambda: plain_run(test_dirs), timeout=max(10, args.budget / 3))
+    if plain is None or plain["status"] not in (0, 1, 5):
+        print("mutants: the tests could not be collected or did not finish. Run check_tests and "
+              "python -m pytest -q tests_new, fix the errors, then try again.")
+        return 2
+    failing = set(plain["failed"])   # these fail on the current code: left out, they cannot tell mutants apart
+    cov = run_one(lambda: coverage_run(files.values(), test_dirs), timeout=max(10, end - time.time() - 10))
+    if cov is None:
+        print("mutants: the test run with coverage did not finish. Try --tests tests_new.")
+        return 2
+    hits, nodeids = cov["hits"], cov["nodeids"]
+    deselect = [arg for n in sorted(failing) if "::" in n for arg in ("--deselect", n)]
+    budget_end = time.time() + max(5.0, end - time.time()) * (0.7 if not args.no_witness else 1.0)
+
+    # 2. Run each covered mutant on the tests that reach its line.
+    queue = []
+    for m in mutants:
+        tests = hits.get(f"{m.file}:{m.line}")
+        if not tests:
+            m.status = UNCOVERED
+            continue
+        if -1 in tests:          # the line runs at import time: every test depends on it
+            selection = [*test_dirs, *deselect]
+        else:
+            selection = [nodeids[i] for i in tests if i >= 0 and nodeids[i] not in failing]
+        if not selection:
+            m.status = UNCOVERED
+            continue
+        queue.append((m, selection))
+    workers = max(1, min(4, os.cpu_count() or 1))
+    running = {}
+
+    def work_for(m, selection):
+        def work():
+            import pytest as _pytest
+            install(m, trees, packages)
+            return int(_pytest.main(pytest_args(selection)))
+        return work
+
+    while queue or running:
+        while queue and len(running) < workers and time.time() < budget_end:
+            m, selection = queue.pop(0)
+            pid, fd = fork(work_for(m, selection), timeout=30)
+            os.set_blocking(fd, False)
+            running[pid] = (m, fd, time.time(), b"")
+        if not running:
+            break
+        for pid, (m, fd, start, data) in list(running.items()):
+            try:
+                chunk = os.read(fd, 65536)
+                if chunk:
+                    running[pid] = (m, fd, start, data + chunk)
+                    continue
+            except BlockingIOError:
+                pass
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            if done:
+                try:
+                    data += os.read(fd, 65536)
+                except BlockingIOError:
+                    pass
+                os.close(fd)
+                del running[pid]
+                try:
+                    code = json.loads(data.decode()) if data else None
+                except json.JSONDecodeError:
+                    code = None
+                m.status = SURVIVED if code == 0 else KILLED if code in (1, 2) else ERROR
+            elif time.time() - start > 10:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                os.close(fd)
+                del running[pid]
+                m.status = TIMEOUT
+        time.sleep(0.003)
+
+    survivors = [m for m in mutants if m.status == SURVIVED]
+    counts = {s: sum(m.status == s for m in mutants) for s in (KILLED, TIMEOUT, SURVIVED, UNCOVERED, ERROR, NOT_RUN)}
+
+    # 3. For survivors: an input on which current code and mutant behave differently, and the spec.
+    shown = order_survivors(survivors, args.show * 3)
+    if not args.no_witness and shown:
+        find_witnesses(shown, trees, packages, root, max(end, time.time() + 10), args.seed)
+        shown.sort(key=lambda m: not m.witness)   # stable: keeps one-per-function order within each group
+    shown = shown[:args.show]
+
+    run = counts[KILLED] + counts[TIMEOUT] + counts[SURVIVED]
+    scope = f" in {args.target!r}" if args.target else ""
+    if failing:
+        print(f"note: {len(failing)} test(s) fail on the current code and were left out "
+              f"(each is a bug you found or a wrong test): " + ", ".join(sorted(failing)[:5])
+              + (" ..." if len(failing) > 5 else ""))
+    print(f"mutants: {total} mutants{scope}, {len(mutants)} chosen, {run} run against {' + '.join(test_dirs)} "
+          f"in {time.time() - started:.0f} s")
+    print(f"  killed {counts[KILLED] + counts[TIMEOUT]}, SURVIVED {counts[SURVIVED]}, not reached by any test "
+          f"{counts[UNCOVERED]}" + (f", not run (time budget) {counts[NOT_RUN]}" if counts[NOT_RUN] else "")
+          + (f", errors {counts[ERROR]}" if counts[ERROR] else ""))
+    if run:
+        print(f"  mutation score {100 * (counts[KILLED] + counts[TIMEOUT]) / run:.0f}% of the mutants run")
+    if not survivors and not counts[UNCOVERED]:
+        print("No survivors: your tests notice every change that was tried here.")
+        return 0
+
+    if shown:
+        print("\nSURVIVED: every test passes with this change, so this behaviour is untested. The current code has "
+              "bugs, so a mutant may be the CORRECT version: decide from the spec, not from 'current'.\n")
+        scopes = []
+        for m in shown:
+            print(f"M{m.mid}  {m.file.relative_to(root)}:{m.line}  in {m.scope or '(module)'}")
+            print(f"    `{m.before}`  ->  `{m.after}`")
+            if m.witness:
+                print(m.witness)
+            elif not args.no_witness:
+                print("    (no input found that tells them apart: maybe equivalent, or needs a scenario; try sbst "
+                      f"{scope_target(m.scope) or m.scope} --line {m.line})")
+            scopes.append(m.scope)
+            print()
+        if len(survivors) > len(shown):
+            rest = sorted({f"{m.scope or '(module)'}:{m.line}" for m in survivors if m not in shown},
+                          key=lambda t: (t.rsplit(":", 1)[0], int(t.rsplit(":", 1)[1])))
+            print(f"{len(survivors) - len(shown)} more survivors at: " + ", ".join(rest[:25]) + (" ..." if len(rest) > 25 else ""))
+        spec_section(scopes, files, packages)
+
+    uncovered = [m for m in mutants if m.status == UNCOVERED]
+    if uncovered:
+        lines = {}
+        for m in uncovered:
+            lines.setdefault(m.scope or "(module)", set()).add(m.line)
+        print("\nNot reached by any test (write a test that calls these first):")
+        for name, ls in sorted(lines.items(), key=lambda kv: -len(kv[1]))[:12]:
+            print(f"  {name}: lines {', '.join(str(l) for l in sorted(ls)[:10])}")
+    print("\nFor each survivor: look up its claim above. If the spec promises a result, write a test asserting the "
+          "spec's result (it must pass on correct code). If the spec matches the MUTANT, the current code is likely "
+          "buggy there: assert the spec's result anyway. If the spec says nothing, skip it.")
+    return 0
+
+
+def order_survivors(survivors, limit):
+    """One per function first, so the printout covers as many functions as possible."""
+    seen, first, rest = set(), [], []
+    for m in survivors:
+        (rest if m.scope in seen else first).append(m)
+        seen.add(m.scope)
+    return (first + rest)[:limit]
+
+
+def scope_target(scope):
+    """The sbst/generator target for a mutant's scope: Class.method, function, or class."""
+    parts = scope.split(".")
+    return ".".join(parts[:2]) if parts and parts[0] else ""
+
+
+# ------------------------------------------------------------------------------------ check failing
+def run_many(jobs, deadline, workers=4, per_job=10.0):
+    """Run each job (a function) in a forked child, a few at a time. Returns {index: result or None}."""
+    results, queue, running = {}, list(enumerate(jobs)), {}
+    workers = max(1, min(workers, os.cpu_count() or 1))
+    while queue or running:
+        while queue and len(running) < workers and time.time() < deadline:
+            i, job = queue.pop(0)
+            pid, fd = fork(job, timeout=per_job)
+            os.set_blocking(fd, False)
+            running[pid] = (i, fd, time.time(), b"")
+        if not running:
+            break
+        for pid, (i, fd, start, data) in list(running.items()):
+            try:
+                chunk = os.read(fd, 65536)
+                if chunk:
+                    running[pid] = (i, fd, start, data + chunk)
+                    continue
+            except BlockingIOError:
+                pass
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            if done or time.time() - start > per_job:
+                if not done:
+                    os.kill(pid, signal.SIGKILL)
+                    os.waitpid(pid, 0)
+                else:
+                    try:
+                        data += os.read(fd, 65536)
+                    except BlockingIOError:
+                        pass
+                os.close(fd)
+                del running[pid]
+                try:
+                    results[i] = json.loads(data.decode()) if data and done else None
+                except json.JSONDecodeError:
+                    results[i] = None
+        time.sleep(0.003)
+    return results
+
+
+def check_failing(mutants, trees, files, packages, root, test_dirs, deadline):
+    """Which failing new tests can be made to pass by one small change that keeps every other test green?"""
+    import pytest  # noqa: F401  loaded once before forking
+    plain = run_one(lambda: plain_run(test_dirs), timeout=60)
+    if plain is None or plain["status"] not in (0, 1, 5):
+        print("mutants: the tests could not be collected. Run check_tests first.")
+        return 2
+    failing = sorted(n for n in plain["failed"] if "::" in n and n.startswith("tests_new"))
+    if not failing:
+        print("check: no test in tests_new fails on the current code.")
+        return 0
+    cov = run_one(lambda: coverage_run(files.values(), test_dirs), timeout=max(20, deadline - time.time() - 20))
+    if cov is None:
+        print("mutants: the coverage run did not finish.")
+        return 2
+    hits, nodeids = cov["hits"], cov["nodeids"]
+    failing_set = set(failing) | {n for n in plain["failed"]}
+    index = {n: i for i, n in enumerate(nodeids)}
+    wanted = {index[n] for n in failing if n in index}
+
+    # 1. Mutants on lines a failing test runs: which failing tests pass with the mutant?
+    candidates = []
+    for m in mutants:
+        tests = hits.get(f"{m.file}:{m.line}", [])
+        targets = [nodeids[i] for i in tests if i in wanted]
+        if targets:
+            candidates.append((m, targets, [nodeids[i] for i in tests if i >= 0 and nodeids[i] not in failing_set],
+                               -1 in tests))
+
+    def job_for(m, selection):
+        def job():
+            import pytest as _pytest
+            install(m, trees, packages)
+            plugin = CoveragePlugin()
+            _pytest.main([*QUIET, "-p", "no:randomly", *selection], plugins=[plugin])
+            return sorted(set(plugin.nodeids) - plugin.failed)
+        return job
+
+    first_end = time.time() + (deadline - time.time()) * 0.7
+    passed = run_many([job_for(m, t) for m, t, _, _ in candidates], first_end)
+    fixes = [(c, passed[i]) for i, c in enumerate(candidates) if passed.get(i)]
+
+    # 2. Does the rest of the suite still pass with that change? Then the change is a plausible repair.
+    def verify_for(m, others, everything):
+        def job():
+            import pytest as _pytest
+            install(m, trees, packages)
+            deselect = [a for n in sorted(failing_set) if "::" in n for a in ("--deselect", n)]
+            selection = [*test_dirs, *deselect] if everything else others
+            if not selection:
+                return 0
+            return int(_pytest.main([*QUIET, "-x", "-p", "no:randomly", *selection]))
+        return job
+
+    verdicts = run_many([verify_for(c[0], c[2], c[3]) for c, _ in fixes], deadline)
+    confirmed = {}
+    for k, ((m, _, _, _), fixed) in enumerate(fixes):
+        if verdicts.get(k) in (0, 5):
+            for test in fixed:
+                confirmed.setdefault(test, m)
+    tried = sum(1 for i in range(len(candidates)) if i in passed)
+    print(f"check: {len(failing)} failing test(s) in tests_new; {tried}/{len(candidates)} candidate changes tried"
+          + ("" if tried == len(candidates) else " (time budget; raise --budget to try all)"))
+    for test in failing:
+        m = confirmed.get(test)
+        if m:
+            print(f"CONFIRMED {test}  (passes if {m.file.relative_to(root)}:{m.line} `{m.before}` -> `{m.after}`,"
+                  " other tests still pass: likely a real bug)")
+        else:
+            print(f"UNCONFIRMED {test}  (no small change makes it pass: probably a wrong expectation)")
+    return 0
+
+
+# ---------------------------------------------------------------------------------------- witness
+def find_witnesses(candidates, trees, packages, root, deadline, seed):
+    """Run the same generated inputs on the current code and on each survivor; keep the first difference,
+    shrunk to as few calls as still show it."""
+    modules = lib.import_modules(lib.package_files(root, packages))
+    plans = {}
+    for m in candidates:
+        if time.time() > deadline - 2:
+            break
+        name = scope_target(m.scope)
+        if not name:
+            continue
+        if name not in plans:
+            plans[name] = make_plan(name, modules, packages, seed)
+        plan = plans[name]
+        if plan is None:
+            continue
+        target, individuals, baseline = plan
+        if baseline is None:
+            first, second = observe_all(target, individuals, packages), observe_all(target, individuals, packages)
+            if not first or not second:
+                plans[name] = None
+                continue
+            baseline = [a if a == b else None for a, b in zip(first, second)]   # None: not deterministic
+            plans[name] = (target, individuals, baseline)
+        observed = observe_all(target, individuals, packages, m, trees)
+        if not observed:
+            continue
+        differing = [(ind, base, obs) for ind, base, obs in zip(individuals, baseline, observed)
+                     if base is not None and obs != base]
+        if differing:   # the cleanest one: fewest exceptions on the way, then fewest calls
+            ind, base, obs = min(differing, key=lambda d: (noise(*d), len(d[0].steps)))
+            ind, base, obs = shrink(target, ind, base, obs, m, trees, packages, deadline)
+            m.witness = format_witness(target, ind, base, obs)
+
+
+def make_plan(name, modules, packages, seed):
+    found = lib.resolve(name, modules, packages) or lib.resolve(name.split(".")[0], modules, packages)
+    if len(found) != 1:
+        return None
+    target = found[0]
+    gen = lib.Generator(target, packages, random.Random(seed), max_steps=12)
+    # Many sequences of growing length: state-dependent behaviour (a full cache, a split node) needs
+    # several calls before the changed line makes a difference. Shortest first.
+    individuals = sorted((gen.random(min_steps=k % 11) for k in range(WITNESS_RUNS)), key=lambda i: len(i.steps))
+    return target, individuals, None
+
+
+def observe_all(target, individuals, packages, mutant=None, trees=None):
+    """Observations of each individual, on the current code or (with mutant) on the mutant, in a child."""
+    def work():
+        if mutant is None:
+            fresh_package(packages)
+        else:
+            install(mutant, trees, packages)
+        return [observe(target, i) for i in individuals]
+    return run_one(work, timeout=25)
+
+
+def noise(ind, base, obs):
+    """Exceptions before and at the first difference: an input that mostly raises makes a poor test."""
+    i = first_difference(base, obs)
+    upto = base[0][:i + 1] if i is not None else base[0]
+    raised = sum(o.startswith("raises") for o in upto)
+    if i is not None and obs[0][i].startswith("raises"):
+        raised += 1
+    return raised
+
+
+def first_difference(base, obs):
+    for i, (a, b) in enumerate(zip(base[0], obs[0])):
+        if a != b:
+            return i
+    return None
+
+
+def shrink(target, ind, base, obs, mutant, trees, packages, deadline):
+    """Drop the calls after the first difference, then any call whose removal keeps a difference."""
+    i = first_difference(base, obs)
+    if i is not None:
+        keep = i - (1 if ind.ctor else 0) + 1
+        if keep >= 0:
+            ind = lib.Individual(ind.ctor, ind.steps[:keep])
+    while ind.steps and time.time() < deadline - 1:
+        trials = [lib.Individual(ind.ctor, ind.steps[:k] + ind.steps[k + 1:]) for k in range(len(ind.steps))]
+        bases = observe_all(target, [ind] + trials, packages)
+        mutated = observe_all(target, [ind] + trials, packages, mutant, trees)
+        if not bases or not mutated:
+            break
+        base, obs = bases[0], mutated[0]
+        better = next(((t, b, o) for t, b, o in zip(trials, bases[1:], mutated[1:]) if b != o), None)
+        if better is None:
+            break
+        ind, base, obs = better
+    return ind, base, obs
+
+
+def observe(target, ind):
+    outcome = lib.execute(target, ind, time_limit=0.5)
+    return [outcome.observations, outcome.listify, outcome.state]
+
+
+def format_witness(target, ind, base, obs):
+    """The input, with the step where the two versions part marked."""
+    base_obs, listify, base_state = base
+    mut_obs, _, mut_state = obs
+    outcome = lib.Outcome(base_obs, listify, "")
+    marks = {}
+    for i, (a, b) in enumerate(zip(base_obs, mut_obs)):
+        if a != b:
+            a, b = lib.excerpt(a, b)
+            marks[i] = f"current: {a}   |   mutant: {b}"
+            break
+    text = lib.render(target, ind, outcome, indent="        ", marks=marks)
+    if not marks:
+        a, b = lib.excerpt(base_state, mut_state)
+        text += f"\n        # obj afterwards, current: {a}\n        # obj afterwards, mutant:  {b}"
+    return "    current code and mutant differ on:\n" + text
+
+
+def spec_section(scopes, files, packages):
+    names = []
+    for scope in scopes:
+        parts = scope.split(".")
+        if parts and parts[0]:
+            names.append(".".join(parts[:2]))
+            if len(parts) > 1:
+                names.append(parts[0])
+    names = list(dict.fromkeys(names))
+    claims = lib.spec_claims(names, packages, per_entity=3)
+    print("Spec from extract_spec (step 1) for these functions:")
+    print(lib.format_claims(claims, names))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
